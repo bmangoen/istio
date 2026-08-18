@@ -67,11 +67,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           LABEL="cherrypick/${{ inputs.release_branch }}"
-          if gh label list --search "$LABEL" --json name --jq '.[].name' | grep -qx "$LABEL"; then
-            echo "Label '$LABEL' already exists, skipping"
+          REPO="${{ github.repository }}"
+          if gh label list --repo "$REPO" --search "$LABEL" --json name --jq '.[].name' | grep -qx "$LABEL"; then
+            echo "Label '$LABEL' already exists in $REPO, skipping"
           else
-            gh label create "$LABEL" --color "0E8A16" --description "Cherrypick to ${{ inputs.release_branch }}"
-            echo "Created label '$LABEL'"
+            gh label create "$LABEL" --repo "$REPO" --color "0E8A16" --description "Cherrypick to ${{ inputs.release_branch }}"
+            echo "Created label '$LABEL' in $REPO"
           fi
 
       - name: Summary
