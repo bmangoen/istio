@@ -33,11 +33,13 @@ type filter struct {
 	selects         map[string]string
 	labels          map[string]string
 	generic         func(any) bool
+	suppressChange  func(o, n any) bool
 
 	index *indexFilter
 }
 
 type indexFilter struct {
+	filterUID    collectionUID
 	list         func() any
 	indexMatches func(any) bool
 	extractKeys  objectKeyExtractor
@@ -51,17 +53,17 @@ func getKeyExtractor(o any) []string {
 }
 
 // reverseIndexKey
-func (f *filter) reverseIndexKey() ([]string, indexedDependencyType, objectKeyExtractor, bool) {
+func (f *filter) reverseIndexKey() ([]string, indexedDependencyType, objectKeyExtractor, collectionUID, bool) {
 	if f.keys.Len() > 0 {
 		if f.index != nil {
 			panic("cannot filter by index and key")
 		}
-		return f.keys.List(), getKeyType, getKeyExtractor, true
+		return f.keys.List(), getKeyType, getKeyExtractor, 0, true
 	}
 	if f.index != nil {
-		return []string{f.index.key}, indexType, f.index.extractKeys, true
+		return []string{f.index.key}, indexType, f.index.extractKeys, f.index.filterUID, true
 	}
-	return nil, unknownIndexType, nil, false
+	return nil, unknownIndexType, nil, 0, false
 }
 
 func (f *filter) String() string {
@@ -80,6 +82,9 @@ func (f *filter) String() string {
 	}
 	if f.generic != nil {
 		attrs = append(attrs, "generic")
+	}
+	if f.suppressChange != nil {
+		attrs = append(attrs, "suppressChange")
 	}
 	res := strings.Join(attrs, ",")
 	return fmt.Sprintf("{%s}", res)
@@ -117,6 +122,7 @@ func FilterIndex[K comparable, I any](idx Index[K, I], k K) FetchOption {
 	return func(h *dependency) {
 		// Index is used to pre-filter on the List, and also to match in Matches. Provide type-erased methods for both
 		h.filter.index = &indexFilter{
+			filterUID: idx.id(),
 			list: func() any {
 				return idx.Lookup(k)
 			},
@@ -155,6 +161,25 @@ func FilterGeneric(f func(any) bool) FetchOption {
 	return func(h *dependency) {
 		h.filter.generic = f
 	}
+}
+
+// withUnsafeSuppressChange skips incoming update events when fn returns true.
+// This only applies to dependency change handling for Fetch calls; it does not affect the initial list result.
+// This is dangerous to use; if you use any parts of the object *outside* the comparison function, you will get stale data.
+// Recommended to use with PartialFetch
+func withUnsafeSuppressChange[T any](fn func(T, T) bool) FetchOption {
+	return func(h *dependency) {
+		h.filter.suppressChange = func(o, n any) bool {
+			return fn(o.(T), n.(T))
+		}
+	}
+}
+
+func (f *filter) SuppressChange(ev Event[any]) bool {
+	if f.suppressChange == nil || ev.Old == nil || ev.New == nil {
+		return false
+	}
+	return f.suppressChange(*ev.Old, *ev.New)
 }
 
 func (f *filter) Matches(object any, forList bool) bool {

@@ -29,11 +29,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8s "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/gateway-api/pkg/consts"
 	"sigs.k8s.io/yaml"
 
 	istio "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/config/kube/crd"
+	"istio.io/istio/pilot/pkg/config/kube/gatewaycommon"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/core"
@@ -44,6 +46,7 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	crdvalidation "istio.io/istio/pkg/config/crd"
+	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/gvr"
 	"istio.io/istio/pkg/kube"
@@ -54,8 +57,11 @@ import (
 	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/sets"
 )
+
+var timestampRegex = regexp.MustCompile(`lastTransitionTime:.*`)
 
 var ports = []*model.Port{
 	{
@@ -75,18 +81,47 @@ var ports = []*model.Port{
 	},
 }
 
+var inferencePoolPorts = []*model.Port{
+	{
+		Name:     "http",
+		Port:     54321,
+		Protocol: "HTTP",
+	},
+}
+
 var services = []*model.Service{
 	{
 		Attributes: model.ServiceAttributes{
 			Name:      "istio-ingressgateway",
 			Namespace: "istio-system",
-			ClusterExternalAddresses: &model.AddressMap{
+			ClusterExternalAddresses: model.AddressMap{
 				Addresses: map[cluster.ID][]string{
 					constants.DefaultClusterName: {"1.2.3.4"},
 				},
 			},
 		},
-		Ports:    ports,
+		Ports: []*model.Port{
+			{
+				Name:     "http",
+				Port:     80,
+				Protocol: "HTTP",
+			},
+			{
+				Name:     "https",
+				Port:     443,
+				Protocol: "HTTPS",
+			},
+			{
+				Name:     "tcp",
+				Port:     34000,
+				Protocol: "TCP",
+			},
+			{
+				Name:     "tcp-other",
+				Port:     34001,
+				Protocol: "TCP",
+			},
+		},
 		Hostname: "istio-ingressgateway.istio-system.svc.domain.suffix",
 	},
 	{
@@ -103,6 +138,55 @@ var services = []*model.Service{
 		Ports:    ports,
 		Hostname: "httpbin.default.svc.domain.suffix",
 	},
+	{
+		Attributes: model.ServiceAttributes{
+			Namespace: "default",
+			Labels: map[string]string{
+				InferencePoolExtensionRefSvc:         "ext-proc-svc",
+				InferencePoolExtensionRefPort:        "9002",
+				InferencePoolExtensionRefFailureMode: "FailClose",
+			},
+		},
+		Ports:    inferencePoolPorts,
+		Hostname: host.Name(fmt.Sprintf("%s.default.svc.domain.suffix", firstValue(InferencePoolServiceName("infpool-gen")))),
+	},
+	{
+		Attributes: model.ServiceAttributes{
+			Namespace: "default",
+			Labels: map[string]string{
+				InferencePoolExtensionRefSvc:         "ext-proc-svc-2",
+				InferencePoolExtensionRefPort:        "9002",
+				InferencePoolExtensionRefFailureMode: "FailClose",
+			},
+		},
+		Ports:    inferencePoolPorts,
+		Hostname: host.Name(fmt.Sprintf("%s.default.svc.domain.suffix", firstValue(InferencePoolServiceName("infpool-gen2")))),
+	},
+	{
+		Attributes: model.ServiceAttributes{
+			Namespace: "default",
+			Labels: map[string]string{
+				InferencePoolExtensionRefSvc:         "model1-epp",
+				InferencePoolExtensionRefPort:        "9002",
+				InferencePoolExtensionRefFailureMode: "FailClose",
+			},
+		},
+		Ports:    ports,
+		Hostname: host.Name(fmt.Sprintf("%s.default.svc.domain.suffix", firstValue(InferencePoolServiceName("infpool-model1")))),
+	},
+	{
+		Attributes: model.ServiceAttributes{
+			Namespace: "default",
+			Labels: map[string]string{
+				InferencePoolExtensionRefSvc:         "model2-epp",
+				InferencePoolExtensionRefPort:        "9002",
+				InferencePoolExtensionRefFailureMode: "FailClose",
+			},
+		},
+		Ports:    ports,
+		Hostname: host.Name(fmt.Sprintf("%s.default.svc.domain.suffix", firstValue(InferencePoolServiceName("infpool-model2")))),
+	},
+
 	{
 		Attributes: model.ServiceAttributes{
 			Namespace: "apple",
@@ -384,10 +468,61 @@ D2lWusoe2/nEqfDVVWGWlyJ7yOmqaVm/iNUN9B2N2g==
 -----END RSA PRIVATE KEY-----
 `
 
-	secrets = []runtime.Object{
+	objects = []runtime.Object{
 		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "my-cert-http",
+				Namespace: "istio-system",
+			},
+			Data: map[string][]byte{
+				"tls.crt": []byte(rsaCertPEM),
+				"tls.key": []byte(rsaKeyPEM),
+				"ca.crt":  []byte(rsaCertPEM),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ns2-cert",
+				Namespace: "ns2",
+			},
+			Data: map[string][]byte{
+				"tls.crt": []byte(rsaCertPEM),
+				"tls.key": []byte(rsaKeyPEM),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ns3-cert",
+				Namespace: "ns3",
+			},
+			Data: map[string][]byte{
+				"tls.crt": []byte(rsaCertPEM),
+				"tls.key": []byte(rsaKeyPEM),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "ns4-cert",
+				Namespace: "ns4",
+			},
+			Data: map[string][]byte{
+				"tls.crt": []byte(rsaCertPEM),
+				"tls.key": []byte(rsaKeyPEM),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-cert",
+				Namespace: "istio-system",
+			},
+			Data: map[string][]byte{
+				"tls.crt": []byte(rsaCertPEM),
+				"tls.key": []byte(rsaKeyPEM),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-cert-http2",
 				Namespace: "istio-system",
 			},
 			Data: map[string][]byte{
@@ -399,6 +534,26 @@ D2lWusoe2/nEqfDVVWGWlyJ7yOmqaVm/iNUN9B2N2g==
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "cert",
 				Namespace: "cert",
+			},
+			Data: map[string][]byte{
+				"tls.crt": []byte(rsaCertPEM),
+				"tls.key": []byte(rsaKeyPEM),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "bookinfo-secret",
+				Namespace: "bookinfo",
+			},
+			Data: map[string][]byte{
+				"tls.crt": []byte(rsaCertPEM),
+				"tls.key": []byte(rsaKeyPEM),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "another-secret",
+				Namespace: "bookinfo",
 			},
 			Data: map[string][]byte{
 				"tls.crt": []byte(rsaCertPEM),
@@ -419,15 +574,61 @@ D2lWusoe2/nEqfDVVWGWlyJ7yOmqaVm/iNUN9B2N2g==
 				"tls.key": []byte("SGVsbG8gd29ybGQK"),
 			},
 		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "malformed",
+				Namespace: "istio-system",
+			},
+			Data: map[string]string{
+				"not-ca.crt": "hello",
+			},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "malformed-trustbundle",
+				Namespace: "istio-system",
+			},
+			Data: map[string]string{
+				"ca.crt": "hello",
+			},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-cert-http",
+				Namespace: "istio-system",
+			},
+			Data: map[string]string{
+				"ca.crt": rsaCertPEM,
+			},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "malformed",
+				Namespace: "default",
+			},
+			Data: map[string]string{
+				"not-ca.crt": "hello",
+			},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "auth-cert",
+				Namespace: "default",
+			},
+			Data: map[string]string{
+				"ca.crt": rsaCertPEM,
+			},
+		},
 	}
 )
 
 func init() {
 	features.EnableAlphaGatewayAPI = true
 	features.EnableAmbientWaypoints = true
+	features.EnableAmbientMultiNetwork = true
 	// Recompute with ambient enabled
-	classInfos = getClassInfos()
-	builtinClasses = getBuiltinClasses()
+	gatewaycommon.ClassInfos = gatewaycommon.GetClassInfos()
+	gatewaycommon.BuiltinGatewayClasses = gatewaycommon.GetBuiltinGatewayClasses()
 }
 
 type TestStatusQueue struct {
@@ -508,11 +709,13 @@ func TestConvertResources(t *testing.T) {
 		{name: "http"},
 		{name: "tcp"},
 		{name: "tls"},
+		{name: "tls-terminate"},
 		{name: "grpc"},
 		{name: "mismatch"},
 		{name: "weighted"},
 		{name: "zero"},
 		{name: "mesh"},
+		{name: "foreign-waypoint"},
 		{
 			name: "invalid",
 			validationIgnorer: crdvalidation.NewValidationIgnorer(
@@ -536,45 +739,91 @@ func TestConvertResources(t *testing.T) {
 				"istio-system/^not-allowed-echo-",
 			),
 		},
+		{
+			name: "reference-policy-inferencepool",
+			validationIgnorer: crdvalidation.NewValidationIgnorer(
+				"istio-system/^backend-not-allowed-",
+			),
+		},
 		{name: "serviceentry"},
+		{name: "status"},
 		{name: "eastwest"},
 		{name: "eastwest-tlsoption"},
 		{name: "eastwest-labelport"},
 		{name: "eastwest-remote"},
+		{name: "east-west-ambient"},
 		{name: "mcs"},
 		{name: "route-precedence"},
 		{name: "waypoint"},
 		{name: "isolation"},
+		{name: "backend-lb-policy"},
+		{
+			name: "backend-tls-policy",
+			validationIgnorer: crdvalidation.NewValidationIgnorer(
+				"default/echo-https",
+				"default/external-service",
+				"default/multi-host-service",
+			),
+		},
+		{name: "mix-backend-policy"},
+		{name: "backend-tls-policy-ignored"},
+		{name: "backend-traffic-policy-ignored"},
+		{name: "listenerset"},
+		{name: "listenerset-cross-namespace"},
+		{name: "listenerset-same-name-different-ns"},
+		{name: "listenerset-invalid"},
+		{name: "listenerset-overlapping-port"},
+		{name: "listenerset-hostname-conflict"},
+		{name: "listenerset-protocol-conflict"},
+		{name: "listenerset-https-missing-tls"},
+		{
+			name: "listenerset-empty-listeners",
+			validationIgnorer: crdvalidation.NewValidationIgnorer(
+				"istio-system/parent-gateway",
+			),
+		},
 		{
 			name: "valid-invalid-parent-ref",
 			validationIgnorer: crdvalidation.NewValidationIgnorer(
 				"default/^valid-invalid-parent-ref-",
 			),
 		},
+		{name: "redirect-only"},
+		{name: "reference-grant-multiple-to"},
+		{name: "http-grpc-same-host"},
+		{name: "empty-backend-refs"},
+		{
+			name: "gateway-invalid-parameters-ref",
+			validationIgnorer: crdvalidation.NewValidationIgnorer(
+				"istio-system/^valid-parameters$",
+			),
+		},
+		{name: "frontend-tls-invalid"},
+		{name: "backend-tls-client-cert"},
 	}
 	test.SetForTest(t, &features.EnableGatewayAPIGatewayClassController, false)
+	test.SetForTest(t, &features.EnableGatewayAPIInferenceExtension, true)
+
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			stop := test.NewStop(t)
-			input := readConfig(t, fmt.Sprintf("testdata/%s.yaml", tt.name), validator, nil)
+			input := readConfig(t, fmt.Sprintf("testdata/%s.yaml", tt.name), validator, tt.validationIgnorer)
 			kc := kube.NewFakeClient(input...)
 			setupClientCRDs(t, kc)
 			// Setup a few preconfigured services
 			instances := []*model.ServiceInstance{}
 			for _, svc := range services {
-				instances = append(instances, &model.ServiceInstance{
-					Service:     svc,
-					ServicePort: ports[0],
-					Endpoint:    &model.IstioEndpoint{EndpointPort: 8080},
-				}, &model.ServiceInstance{
-					Service:     svc,
-					ServicePort: ports[1],
-					Endpoint:    &model.IstioEndpoint{},
-				}, &model.ServiceInstance{
-					Service:     svc,
-					ServicePort: ports[2],
-					Endpoint:    &model.IstioEndpoint{},
-				})
+				for i, port := range svc.Ports {
+					epPort := uint32(0)
+					if i == 0 {
+						epPort = 8080 // Just to make sure we test mismatch
+					}
+					instances = append(instances, &model.ServiceInstance{
+						Service:     svc,
+						ServicePort: port,
+						Endpoint:    &model.IstioEndpoint{EndpointPort: epPort},
+					})
+				}
 			}
 			cg := core.NewConfigGenTest(t, core.TestOptions{
 				Services:  services,
@@ -606,6 +855,8 @@ func TestConvertResources(t *testing.T) {
 			sortConfigByCreationTime(res)
 			vs := ctrl.List(gvk.VirtualService, "")
 			res = append(res, sortedConfigByCreationTime(vs)...)
+			dr := ctrl.List(gvk.DestinationRule, "")
+			res = append(res, sortedConfigByCreationTime(dr)...)
 
 			goldenFile := fmt.Sprintf("testdata/%s.yaml.golden", tt.name)
 			util.CompareContent(t, marshalYaml(t, res), goldenFile)
@@ -621,15 +872,19 @@ func setupClientCRDs(t *testing.T, kc kube.CLIClient) {
 	for _, crd := range []schema.GroupVersionResource{
 		gvr.KubernetesGateway,
 		gvr.ReferenceGrant,
+		gvr.ListenerSet,
 		gvr.GatewayClass,
 		gvr.HTTPRoute,
 		gvr.GRPCRoute,
 		gvr.TCPRoute,
 		gvr.TLSRoute,
 		gvr.ServiceEntry,
+		gvr.XBackendTrafficPolicy,
+		gvr.BackendTLSPolicy,
+		gvr.InferencePool,
 	} {
 		clienttest.MakeCRDWithAnnotations(t, kc, crd, map[string]string{
-			consts.BundleVersionAnnotation: "v1.1.0",
+			consts.BundleVersionAnnotation: consts.BundleVersion,
 		})
 	}
 }
@@ -1130,6 +1385,65 @@ func TestSortHTTPRoutes(t *testing.T) {
 	}
 }
 
+// Test is a little janky, but it checks if we can pass a `parent.Hostnames` in the form
+// of `*.example.com` and `*/*.example.com` without a panic and successfully match.
+func TestGatewayReferenceAllowedParentHostnameParsing(t *testing.T) {
+	cases := []struct {
+		Name            string
+		ParentHostnames []string
+		RouteHostnames  []k8s.Hostname
+	}{
+		{
+			Name:            "implied wildcard",
+			ParentHostnames: []string{"*.example.com"},
+			RouteHostnames:  []k8s.Hostname{"bookinfo.example.com"},
+		},
+		{
+			Name:            "explicit wildcard",
+			ParentHostnames: []string{"*/*.example.com"},
+			RouteHostnames:  []k8s.Hostname{"bookinfo.example.com"},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.Name, func(t *testing.T) {
+			// ctx doesn't end up getting used, but we need to pass something
+			ctx := RouteContext{}
+			routeKind := gvk.HTTPRoute
+			parent := parentInfo{
+				InternalName: "default/bookinfo-gateway-istio-autogenerated-k8s-gateway-http",
+				Hostnames:    []string{"*.example.com"},
+				AllowedKinds: []k8s.RouteGroupKind{
+					gatewaycommon.ToRouteKind(gvk.HTTPRoute),
+					gatewaycommon.ToRouteKind(gvk.GRPCRoute),
+				},
+				OriginalHostname: "",
+				SectionName:      "http",
+				Port:             80,
+				Protocol:         "HTTP",
+			}
+			parentRef := parentReference{
+				parentKey: parentKey{
+					Kind:      gvk.Gateway,
+					Name:      "bookinfo-gateway",
+					Namespace: "default",
+				},
+				SectionName: "",
+				Port:        0,
+			}
+			hostnames := []k8s.Hostname{"bookinfo.example.com"}
+
+			parentError, waypointError := referenceAllowed(ctx, &parent, routeKind, parentRef, hostnames, "default")
+			if parentError != nil {
+				t.Fatalf("expected no error, got %v", parentError)
+			}
+			if waypointError != nil {
+				t.Fatalf("expected no error, got %v", waypointError)
+			}
+		})
+	}
+}
+
 func TestReferencePolicy(t *testing.T) {
 	validator := crdvalidation.NewIstioValidator(t)
 	type res struct {
@@ -1272,6 +1586,32 @@ spec:
 				{"kubernetes-gateway://default/private", "default", false},
 			},
 		},
+		{
+			name: "multiple To with names (OR semantics)",
+			config: `apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+ name: k8s-gateway-secret-grant
+ namespace: default
+spec:
+ from:
+ - group: gateway.networking.k8s.io
+   kind: Gateway
+   namespace: bookinfo-ingress
+ to:
+ - group: ""
+   kind: Secret
+   name: bookinfo-secret
+ - group: ""
+   kind: Secret
+   name: another-secret
+`,
+			expectations: []res{
+				{"kubernetes-gateway://default/bookinfo-secret", "bookinfo-ingress", true},
+				{"kubernetes-gateway://default/another-secret", "bookinfo-ingress", true},
+				{"kubernetes-gateway://default/other-secret", "bookinfo-ingress", false},
+			},
+		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1279,7 +1619,7 @@ spec:
 			kr := setupController(t, input...)
 			for _, sc := range tt.expectations {
 				t.Run(fmt.Sprintf("%v/%v", sc.name, sc.namespace), func(t *testing.T) {
-					got := kr.SecretAllowed(sc.name, sc.namespace)
+					got := kr.SecretAllowed(gvk.KubernetesGateway, sc.name, sc.namespace)
 					if got != sc.allowed {
 						t.Fatalf("expected allowed=%v, got allowed=%v", sc.allowed, got)
 					}
@@ -1288,8 +1628,6 @@ spec:
 		})
 	}
 }
-
-var timestampRegex = regexp.MustCompile(`lastTransitionTime:.*`)
 
 func readConfig(t testing.TB, filename string, validator *crdvalidation.Validator, ignorer *crdvalidation.ValidationIgnorer) []runtime.Object {
 	t.Helper()
@@ -1322,7 +1660,7 @@ func readConfig(t testing.TB, filename string, validator *crdvalidation.Validato
 		}
 		objs = append(objs, svcObj)
 	}
-	objs = append(objs, secrets...)
+	objs = append(objs, objects...)
 
 	for ns := range namespaces {
 		objs = append(objs, &corev1.Namespace{
@@ -1370,19 +1708,99 @@ func marshalYaml(t test.Failer, cl []config.Config) []byte {
 	return result
 }
 
-func TestHumanReadableJoin(t *testing.T) {
+func TestCreateHeadersFilter(t *testing.T) {
 	tests := []struct {
-		input []string
-		want  string
+		name      string
+		filter    *k8s.HTTPHeaderFilter
+		wantErr   bool
+		errReason ConfigErrorReason
 	}{
-		{[]string{"a"}, "a"},
-		{[]string{"a", "b"}, "a and b"},
-		{[]string{"a", "b", "c"}, "a, b, and c"},
+		{
+			name:    "nil filter",
+			filter:  nil,
+			wantErr: false,
+		},
+		{
+			name: "valid headers",
+			filter: &k8s.HTTPHeaderFilter{
+				Set: []k8s.HTTPHeader{{Name: "x-foo", Value: "bar"}},
+				Add: []k8s.HTTPHeader{{Name: "x-baz", Value: "qux"}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "newline in set header value",
+			filter: &k8s.HTTPHeaderFilter{
+				Set: []k8s.HTTPHeader{{Name: "content-security-policy", Value: "default-src 'self';\nscript-src 'self';"}},
+			},
+			wantErr:   true,
+			errReason: InvalidFilter,
+		},
+		{
+			name: "carriage return in set header value",
+			filter: &k8s.HTTPHeaderFilter{
+				Set: []k8s.HTTPHeader{{Name: "x-foo", Value: "bar\rbaz"}},
+			},
+			wantErr:   true,
+			errReason: InvalidFilter,
+		},
+		{
+			name: "newline in add header value",
+			filter: &k8s.HTTPHeaderFilter{
+				Add: []k8s.HTTPHeader{{Name: "x-foo", Value: "bar\nbaz"}},
+			},
+			wantErr:   true,
+			errReason: InvalidFilter,
+		},
+		{
+			name: "null byte in header value",
+			filter: &k8s.HTTPHeaderFilter{
+				Set: []k8s.HTTPHeader{{Name: "x-foo", Value: "bar\x00baz"}},
+			},
+			wantErr:   true,
+			errReason: InvalidFilter,
+		},
+		{
+			name: "control character in header value",
+			filter: &k8s.HTTPHeaderFilter{
+				Set: []k8s.HTTPHeader{{Name: "x-foo", Value: "bar\x01baz"}},
+			},
+			wantErr:   true,
+			errReason: InvalidFilter,
+		},
+		{
+			name: "DEL character in header value",
+			filter: &k8s.HTTPHeaderFilter{
+				Set: []k8s.HTTPHeader{{Name: "x-foo", Value: "bar\x7Fbaz"}},
+			},
+			wantErr:   true,
+			errReason: InvalidFilter,
+		},
+		{
+			name: "tab in header value is valid",
+			filter: &k8s.HTTPHeaderFilter{
+				Set: []k8s.HTTPHeader{{Name: "x-foo", Value: "bar\tbaz"}},
+			},
+			wantErr: false,
+		},
 	}
 	for _, tt := range tests {
-		t.Run(strings.Join(tt.input, "_"), func(t *testing.T) {
-			if got := humanReadableJoin(tt.input); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("got %v, want %v", got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := createHeadersFilter(tt.filter)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error but got none")
+				}
+				if err.Reason != tt.errReason {
+					t.Errorf("got reason %q, want %q", err.Reason, tt.errReason)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if tt.filter != nil && got == nil {
+					t.Errorf("expected non-nil result for non-nil filter")
+				}
 			}
 		})
 	}
@@ -1545,7 +1963,7 @@ func TestHumanReadableJoin(t *testing.T) {
 func kubernetesObjectsFromString(s string) ([]runtime.Object, error) {
 	var objects []runtime.Object
 	decode := kube.IstioCodec.UniversalDeserializer().Decode
-	objectStrs := strings.Split(s, "---")
+	objectStrs := strings.Split(s, "\n---\n")
 	for _, s := range objectStrs {
 		if len(strings.TrimSpace(s)) == 0 {
 			continue
@@ -1557,4 +1975,100 @@ func kubernetesObjectsFromString(s string) ([]runtime.Object, error) {
 		objects = append(objects, o)
 	}
 	return objects, nil
+}
+
+func firstValue[T, U any](val T, _ U) T {
+	return val
+}
+
+// TestListenerSetStatusTruncatesOnListenerRemoval is a regression test for a bug where a
+// listener removed from a ListenerSet's spec left an orphaned entry in status.Listeners
+// forever. ListenerSetCollection threads the previous status forward (to preserve
+// per-listener data across reconciles) but only refreshes entries for listeners still in
+// the spec, and reportListenerSetStatus did not prune the stale ones the way
+// reportGatewayStatus does for Gateways. The leftover entry left
+// len(status.Listeners) > len(spec.Listeners) and eventually wedged observedGeneration.
+//
+// The ListenerSet is created with a spec of 2 listeners but a status that already carries
+// 3 (one stale entry), simulating the post-removal state. A correct reconcile must prune
+// the status back to the 2 listeners that are still in the spec.
+func TestListenerSetStatusTruncatesOnListenerRemoval(t *testing.T) {
+	test.SetForTest(t, &features.EnableGatewayAPIGatewayClassController, false)
+	stop := test.NewStop(t)
+	kc := kube.NewFakeClient()
+	setupClientCRDs(t, kc)
+	cg := core.NewConfigGenTest(t, core.TestOptions{})
+
+	gatewayClasses := clienttest.NewWriter[*k8s.GatewayClass](t, kc)
+	gateways := clienttest.NewWriter[*k8s.Gateway](t, kc)
+	listenerSets := clienttest.NewWriter[*k8s.ListenerSet](t, kc)
+
+	ctrl := NewController(kc, AlwaysReady, controller.Options{DomainSuffix: "domain.suffix", KrtDebugger: &krt.DebugHandler{}}, nil)
+	sq := &TestStatusQueue{state: map[status.Resource]any{}}
+	go ctrl.Run(stop)
+	kc.RunAndWait(stop)
+	ctrl.Reconcile(cg.PushContext())
+	kube.WaitForCacheSync("test", stop, ctrl.HasSynced)
+	ctrl.status.SetQueue(sq)
+
+	gatewayClasses.Create(&k8s.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "istio"},
+		Spec:       k8s.GatewayClassSpec{ControllerName: "istio.io/gateway-controller"},
+	})
+	gateways.Create(&k8s.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "parent", Namespace: "istio-system"},
+		Spec: k8s.GatewaySpec{
+			GatewayClassName: "istio",
+			AllowedListeners: &k8s.AllowedListeners{
+				Namespaces: &k8s.ListenerNamespaces{From: ptr.Of(k8s.NamespacesFromAll)},
+			},
+			Listeners: []k8s.Listener{{
+				Name:     "default",
+				Hostname: ptr.Of(k8s.Hostname("example.com")),
+				Protocol: k8s.HTTPProtocolType,
+				Port:     80,
+			}},
+		},
+	})
+
+	entry := func(n string) k8s.ListenerEntry {
+		return k8s.ListenerEntry{
+			Name:     k8s.SectionName(n),
+			Hostname: ptr.Of(k8s.Hostname(n + ".example.com")),
+			Protocol: k8s.HTTPProtocolType,
+			Port:     80,
+		}
+	}
+	listenerSets.Create(&k8s.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "set", Namespace: "istio-system"},
+		Spec: k8s.ListenerSetSpec{
+			ParentRef: k8s.ParentGatewayReference{
+				Group:     ptr.Of(k8s.Group("gateway.networking.k8s.io")),
+				Kind:      ptr.Of(k8s.Kind("Gateway")),
+				Name:      "parent",
+				Namespace: ptr.Of(k8s.Namespace("istio-system")),
+			},
+			Listeners: []k8s.ListenerEntry{entry("a"), entry("b")},
+		},
+		// Stale status: a previous, larger spec left an orphaned "stale" listener entry.
+		Status: k8s.ListenerSetStatus{
+			Listeners: []k8s.ListenerEntryStatus{{Name: "a"}, {Name: "b"}, {Name: "stale"}},
+		},
+	})
+
+	statusListenerCount := func() int {
+		for _, s := range sq.Statuses() {
+			switch st := s.(type) {
+			case *k8s.ListenerSetStatus:
+				return len(st.Listeners)
+			case k8s.ListenerSetStatus:
+				return len(st.Listeners)
+			}
+		}
+		return -1
+	}
+
+	// With the fix, the orphaned "stale" entry is pruned and status matches the 2 spec
+	// listeners. Without the fix, status stays at 3.
+	assert.EventuallyEqual(t, statusListenerCount, 2)
 }

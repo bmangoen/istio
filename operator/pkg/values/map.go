@@ -510,10 +510,10 @@ func extractKV(seg string) (string, string, bool) {
 
 // getPV returns the path and value components for the given set flag string, which must be in path=value format.
 func getPV(setFlag string) (path string, value string) {
-	pv := strings.Split(setFlag, "=")
+	pv := strings.SplitN(setFlag, "=", 2)
 	if len(pv) != 2 {
 		return setFlag, ""
 	}
 	path, value = strings.TrimSpace(pv[0]), strings.TrimSpace(pv[1])
-	return
+	return path, value
 }

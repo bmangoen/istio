@@ -43,7 +43,6 @@ import (
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/version"
 	iptables "istio.io/istio/tools/istio-iptables/pkg/cmd"
-	iptableslog "istio.io/istio/tools/istio-iptables/pkg/log"
 )
 
 const (
@@ -103,8 +102,6 @@ func newProxyCommand(sds istioagent.SDSServiceFactory) *cobra.Command {
 			cmd.PrintFlags(c.Flags())
 			log.Infof("Version %s", version.Info.String())
 
-			raiseLimits()
-
 			err := initProxy(args)
 			if err != nil {
 				return err
@@ -130,12 +127,14 @@ func newProxyCommand(sds istioagent.SDSServiceFactory) *cobra.Command {
 			}
 
 			envoyOptions := envoy.ProxyConfig{
-				LogLevel:          proxyArgs.ProxyLogLevel,
-				ComponentLogLevel: proxyArgs.ProxyComponentLogLevel,
-				LogAsJSON:         loggingOptions.JSONEncoding,
-				NodeIPs:           proxyArgs.IPAddresses,
-				Sidecar:           proxyArgs.Type == model.SidecarProxy,
-				OutlierLogPath:    proxyArgs.OutlierLogPath,
+				LogLevel:           proxyArgs.ProxyLogLevel,
+				ComponentLogLevel:  proxyArgs.ProxyComponentLogLevel,
+				LogAsJSON:          loggingOptions.JSONEncoding,
+				NodeIPs:            proxyArgs.IPAddresses,
+				Sidecar:            proxyArgs.Type == model.SidecarProxy,
+				OutlierLogPath:     proxyArgs.OutlierLogPath,
+				FileFlushInterval:  proxyConfig.FileFlushInterval,
+				FileFlushMinSizeKB: proxyConfig.FileFlushMinSizeKb,
 			}
 			agentOptions := options.NewAgentOptions(&proxyArgs, proxyConfig, sds)
 			agent := istioagent.NewAgent(proxyConfig, agentOptions, secOpts, envoyOptions)
@@ -150,8 +149,6 @@ func newProxyCommand(sds istioagent.SDSServiceFactory) *cobra.Command {
 					return err
 				}
 			}
-
-			go iptableslog.ReadNFLOGSocket(ctx)
 
 			// On SIGINT or SIGTERM, cancel the context, triggering a graceful shutdown
 			go cmd.WaitSignalFunc(cancel)
@@ -341,13 +338,4 @@ func getExcludeInterfaces() sets.String {
 
 	log.Infof("Exclude IPs %v based on %s annotation", excludeAddrs, annotation.SidecarTrafficExcludeInterfaces.Name)
 	return excludeAddrs
-}
-
-func raiseLimits() {
-	limit, err := RaiseFileLimits()
-	if err != nil {
-		log.Warnf("failed setting file limit: %v", err)
-	} else {
-		log.Infof("Set max file descriptors (ulimit -n) to: %d", limit)
-	}
 }

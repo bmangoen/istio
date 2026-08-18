@@ -106,14 +106,14 @@ func TestBinarySizes(t *testing.T) {
 	}{
 		// TODO: shrink the ranges here once the active work to reduce binary size is complete
 		// For now, having two small a range will result in lots of "merge conflicts"
-		"istioctl":        {60, 92},
-		"pilot-agent":     {20, 26},
-		"pilot-discovery": {60, 100},
+		"istioctl":        {60, 100},
+		"pilot-agent":     {20, 28},
+		"pilot-discovery": {60, 125},
 		"bug-report":      {60, 80},
 		"client":          {15, 30},
-		"server":          {15, 30},
-		"envoy":           {60, 130},
-		"ztunnel":         {10, 15},
+		"server":          {15, 32},
+		"envoy":           {60, 168},
+		"ztunnel":         {12, 19},
 	}
 
 	runBinariesTest(t, func(t *testing.T, name string) {

@@ -15,6 +15,9 @@
 package krt
 
 import (
+	"k8s.io/apimachinery/pkg/types"
+
+	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/slices"
 )
 
@@ -36,6 +39,32 @@ func FetchOrList[T any](ctx HandlerContext, cc Collection[T], opts ...FetchOptio
 	return fetch[T](ctx, cc, true, opts...)
 }
 
+// PartialFetch is a wrapper around Fetch + withUnsafeSuppressChange to safely fetch a subset of an object, without trigger
+// recomputation when the unused part of the object changes
+func PartialFetch[T any, S any](ctx HandlerContext, cc Collection[T], xfm func(T) S, equality func(S, S) bool, opts ...FetchOption) []S {
+	t := fetch[T](ctx, cc, false, append(opts, withUnsafeSuppressChange(func(a T, b T) bool {
+		return equality(xfm(a), xfm(b))
+	}))...)
+	return slices.Map(t, xfm)
+}
+
+func PartialFetchComparable[T any, S comparable](ctx HandlerContext, cc Collection[T], xfm func(T) S, opts ...FetchOption) []S {
+	return PartialFetch(ctx, cc, xfm, func(s S, s2 S) bool {
+		return s == s2
+	}, opts...)
+}
+
+func extractNamespacedName[T controllers.ComparableObject](t T) types.NamespacedName {
+	return types.NamespacedName{
+		Namespace: t.GetNamespace(),
+		Name:      t.GetName(),
+	}
+}
+
+func ResourceExists[T controllers.ComparableObject](ctx HandlerContext, cc Collection[T], key string) bool {
+	return len(PartialFetchComparable(ctx, cc, extractNamespacedName, FilterKey(key))) > 0
+}
+
 // Fetch runs a query against the provided collection and subscribes to updates.
 func Fetch[T any](ctx HandlerContext, cc Collection[T], opts ...FetchOption) []T {
 	return fetch[T](ctx, cc, false, opts...)
@@ -55,7 +84,7 @@ func fetch[T any](ctx HandlerContext, cc Collection[T], allowMissingContext bool
 	if ctx != nil {
 		h := ctx.(registerDependency)
 		// Important: register before we List(), so we cannot miss any events
-		h.registerDependency(d, c, func(f erasedEventHandler) Syncer {
+		h.registerDependency(d, c, func(f erasedEventHandler) HandlerRegistration {
 			ff := func(o []Event[T]) {
 				f(slices.Map(o, castEvent[T, any]))
 			}

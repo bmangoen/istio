@@ -17,11 +17,13 @@ package controller
 import (
 	"context"
 	"strings"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"istio.io/api/annotation"
+	"istio.io/istio/pilot/pkg/config/kube/clustertrustbundle"
 	"istio.io/istio/pilot/pkg/config/kube/crdclient"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/keycertbundle"
@@ -32,10 +34,14 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
 	"istio.io/istio/pkg/backoff"
+	"istio.io/istio/pkg/config/mesh/kubemesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/collections"
 	kubelib "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/multicluster"
+	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/webhooks"
 )
 
@@ -49,22 +55,63 @@ type kubeController struct {
 	*Controller
 	workloadEntryController *serviceentry.Controller
 	stop                    chan struct{}
+
+	// syncedFn, if set, is invoked exactly once, the first time HasSynced observes the
+	// underlying registry has synced. initializeCluster uses this to swap the registry into
+	// the aggregate controller on the update path, without kubeController needing to know why.
+	syncedFn   func()
+	syncedOnce sync.Once
+}
+
+// HasSynced reports whether the underlying kube registry has completed its initial sync.
+// The first time it does, syncedFn (if set) is invoked before returning true. This lets
+// initializeCluster hook cluster-update logic - such as swapping the new registry into the
+// aggregate controller - directly into sync completion: the multicluster framework calls Close()
+// on the previous controller for this cluster as soon as HasSynced returns true, so any such
+// swap must happen here, synchronously, to avoid a window where the aggregate controller has no
+// registry for the cluster.
+func (k *kubeController) HasSynced() bool {
+	if !k.Controller.HasSynced() {
+		return false
+	}
+	if k.syncedFn != nil {
+		k.syncedOnce.Do(k.syncedFn)
+	}
+	return true
 }
 
 func (k *kubeController) Close() {
 	close(k.stop)
 	clusterID := k.Controller.clusterID
 	k.MeshServiceController.UnRegisterHandlersForCluster(clusterID)
-	k.MeshServiceController.DeleteRegistry(clusterID, provider.Kubernetes)
+	// DeleteRegistryIfCurrent avoids deleting a registry that HasSynced's UpdateRegistry call
+	// above already swapped in to replace this one. If it was already superseded, our EDS shard
+	// key now belongs to that new registry, so Cleanup must not remove it.
+	current := k.MeshServiceController.DeleteRegistryIfCurrent(k.Controller)
 	if k.workloadEntryController != nil {
 		k.MeshServiceController.DeleteRegistry(clusterID, provider.External)
 	}
-	if err := k.Controller.Cleanup(); err != nil {
+	if err := k.Controller.Cleanup(current); err != nil {
 		log.Warnf("failed cleaning up services in %s: %v", clusterID, err)
 	}
 	if k.opts.XDSUpdater != nil {
-		k.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true, Reason: model.NewReasonStats(model.ClusterUpdate), Forced: true})
+		k.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Reason: model.NewReasonStats(model.ClusterUpdate), Forced: true})
 	}
+}
+
+// liveServiceHosts returns the hostname/namespace pairs registry currently knows about, for use
+// as the "keep" set passed to XDSUpdater.PruneShard once registry's initial sync completes.
+func liveServiceHosts(registry *Controller) map[string]sets.String {
+	svcs := registry.Services()
+	keep := make(map[string]sets.String, len(svcs))
+	for _, svc := range svcs {
+		hostname := string(svc.Hostname)
+		if keep[hostname] == nil {
+			keep[hostname] = sets.New[string]()
+		}
+		keep[hostname].Insert(svc.Attributes.Namespace)
+	}
+	return keep
 }
 
 // Multicluster structure holds the remote kube Controllers and multicluster specific attributes.
@@ -81,9 +128,9 @@ type Multicluster struct {
 
 	clusterLocal model.ClusterLocalProvider
 
-	startNsController bool
-	caBundleWatcher   *keycertbundle.Watcher
-	revision          string
+	distributeCACert bool
+	caBundleWatcher  *keycertbundle.Watcher
+	revision         string
 
 	component *multicluster.Component[*kubeController]
 }
@@ -95,7 +142,7 @@ func NewMulticluster(
 	serviceEntryController *serviceentry.Controller,
 	caBundleWatcher *keycertbundle.Watcher,
 	revision string,
-	startNsController bool,
+	distributeCACert bool,
 	clusterLocal model.ClusterLocalProvider,
 	s server.Instance,
 	controller *multicluster.Controller,
@@ -104,7 +151,7 @@ func NewMulticluster(
 		serverID:               serverID,
 		opts:                   opts,
 		serviceEntryController: serviceEntryController,
-		startNsController:      startNsController,
+		distributeCACert:       distributeCACert,
 		caBundleWatcher:        caBundleWatcher,
 		revision:               revision,
 		clusterLocal:           clusterLocal,
@@ -117,12 +164,47 @@ func NewMulticluster(
 
 		options := opts
 		options.ClusterID = cluster.ID
+		options.MultiClusterController = controller
 		if !configCluster {
 			options.SyncTimeout = features.RemoteClusterTimeout
 		}
 		log.Infof("Initializing Kubernetes service registry %q", options.ClusterID)
 		options.ConfigCluster = configCluster
+
+		// Create per-cluster mesh watcher for remote clusters
+		// This allows controllers to detect cluster-specific settings that may be relevant for the local proxies, e.g. trust domain.
+		if !configCluster {
+			// Save the config cluster's mesh watcher as fallback for when the remote meshconfig is unreadable
+			// (e.g. during upgrades before RBAC rules are applied to the remote cluster).
+			options.ConfigClusterMeshWatcher = opts.MeshWatcher
+			meshConfigMapName := mc.getMeshConfigMapName()
+			meshSource := kubemesh.NewConfigMapSource(
+				client,
+				options.SystemNamespace,
+				meshConfigMapName,
+				kubemesh.MeshConfigKey,
+				krt.NewOptionsBuilder(stop, "", nil),
+			)
+			remoteMeshCollection := meshwatcher.NewCollection(
+				krt.NewOptionsBuilder(stop, "", nil),
+				meshSource,
+			)
+			options.MeshWatcher = meshwatcher.ConfigAdapter(remoteMeshCollection)
+			log.Infof("Created mesh watcher for remote cluster %q", cluster.ID)
+		}
+
 		kubeRegistry := NewController(client, options)
+
+		// When the remote meshconfig changes (e.g. trust domain becomes readable after RBAC is applied),
+		// trigger a full push so services and endpoints are rebuilt with the correct trust domain.
+		if !configCluster && options.XDSUpdater != nil {
+			options.MeshWatcher.AddMeshHandler(func() {
+				kubeRegistry.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{
+					Reason: model.NewReasonStats(model.GlobalUpdate),
+					Forced: true,
+				})
+			})
+		}
 		kubeController := &kubeController{
 			MeshServiceController: opts.MeshServiceController,
 			Controller:            kubeRegistry,
@@ -133,6 +215,15 @@ func NewMulticluster(
 	})
 
 	return mc
+}
+
+// getMeshConfigMapName returns the mesh ConfigMap name based on the revision
+func (m *Multicluster) getMeshConfigMapName() string {
+	name := "istio"
+	if m.revision == "" || m.revision == "default" {
+		return name
+	}
+	return name + "-" + m.revision
 }
 
 // initializeCluster initializes the cluster by setting various handlers.
@@ -146,10 +237,6 @@ func (m *Multicluster) initializeCluster(cluster *multicluster.Cluster, kubeCont
 		kubeRegistry.AppendWorkloadHandler(m.serviceEntryController.WorkloadInstanceHandler)
 	}
 
-	if configCluster && m.serviceEntryController != nil {
-		kubeRegistry.AppendNamespaceDiscoveryHandlers(m.serviceEntryController.NamespaceDiscoveryHandler)
-	}
-
 	// TODO implement deduping in aggregate registry to allow multiple k8s registries to handle WorkloadEntry
 	if features.EnableK8SServiceSelectWorkloadEntries {
 		if m.serviceEntryController != nil && configCluster {
@@ -160,21 +247,44 @@ func (m *Multicluster) initializeCluster(cluster *multicluster.Cluster, kubeCont
 			configStore := createWleConfigStore(client, m.revision, options)
 			kubeController.workloadEntryController = serviceentry.NewWorkloadEntryController(
 				configStore, options.XDSUpdater,
+				options.MultiClusterController,
 				m.opts.MeshWatcher,
 				serviceentry.WithClusterID(cluster.ID),
-				serviceentry.WithNetworkIDCb(kubeRegistry.Network))
+				serviceentry.WithNetworkIDCb(kubeRegistry.Network),
+				serviceentry.WithKRTDebugger(m.opts.KrtDebugger))
 			// Services can select WorkloadEntry from the same cluster. We only duplicate the Service to configure kube-dns.
 			kubeController.workloadEntryController.AppendWorkloadHandler(kubeRegistry.WorkloadInstanceHandler)
 			// ServiceEntry selects WorkloadEntry from remote cluster
 			kubeController.workloadEntryController.AppendWorkloadHandler(m.serviceEntryController.WorkloadInstanceHandler)
-			kubeRegistry.AppendNamespaceDiscoveryHandlers(kubeController.workloadEntryController.NamespaceDiscoveryHandler)
 			m.opts.MeshServiceController.AddRegistryAndRun(kubeController.workloadEntryController, clusterStopCh)
 			go configStore.Run(clusterStopCh)
 		}
 	}
 
 	// run after WorkloadHandler is added
-	m.opts.MeshServiceController.AddRegistryAndRun(kubeRegistry, clusterStopCh)
+	if cluster.Action == multicluster.Update {
+		// Start the new registry here. The old registry keeps serving until the new one syncs;
+		// syncedFn swaps the new registry into the aggregate controller as soon as that happens,
+		// which is also the signal the multicluster framework uses to close the old kubeController,
+		// so the swap is guaranteed to complete before the old registry is removed.
+		kubeController.syncedFn = func() {
+			log.Infof("cluster %s synced, replacing registry", cluster.ID)
+			m.opts.MeshServiceController.UpdateRegistry(kubeRegistry, clusterStopCh)
+			// The old registry (being replaced) may have written shard entries for services
+			// that no longer exist in the remote cluster - e.g. deleted in the same window the
+			// old registry's watch stopped observing changes. Those services never appear in
+			// kubeRegistry's own sync, so nothing else would ever clean up their stale shard
+			// entries. Prune anything under this shard key that kubeRegistry didn't just
+			// reaffirm.
+			if kubeRegistry.opts.XDSUpdater != nil {
+				kubeRegistry.opts.XDSUpdater.PruneShard(model.ShardKeyFromRegistry(kubeRegistry), liveServiceHosts(kubeRegistry))
+			}
+		}
+		go kubeRegistry.Run(clusterStopCh)
+	} else {
+		// For adds, register immediately
+		m.opts.MeshServiceController.AddRegistryAndRun(kubeRegistry, clusterStopCh)
+	}
 
 	go func() {
 		var shouldLead bool
@@ -182,27 +292,46 @@ func (m *Multicluster) initializeCluster(cluster *multicluster.Cluster, kubeCont
 			shouldLead = m.checkShouldLead(client, options.SystemNamespace, clusterStopCh)
 			log.Infof("should join leader-election for cluster %s: %t", cluster.ID, shouldLead)
 		}
-		if m.startNsController && (shouldLead || configCluster) {
-			// Block server exit on graceful termination of the leader controller.
-			m.s.RunComponentAsyncAndWait("namespace controller", func(_ <-chan struct{}) error {
-				log.Infof("joining leader-election for %s in %s on cluster %s",
-					leaderelection.NamespaceController, options.SystemNamespace, options.ClusterID)
-				election := leaderelection.
-					NewLeaderElectionMulticluster(options.SystemNamespace, m.serverID, leaderelection.NamespaceController, m.revision, !configCluster, client).
-					AddRunFunction(func(leaderStop <-chan struct{}) {
-						log.Infof("starting namespace controller for cluster %s", cluster.ID)
-						nc := NewNamespaceController(client, m.caBundleWatcher)
-						// Start informers again. This fixes the case where informers for namespace do not start,
-						// as we create them only after acquiring the leader lock
-						// Note: stop here should be the overall pilot stop, NOT the leader election stop. We are
-						// basically lazy loading the informer, if we stop it when we lose the lock we will never
-						// recreate it again.
-						client.RunAndWait(clusterStopCh)
-						nc.Run(leaderStop)
-					})
-				election.Run(clusterStopCh)
-				return nil
-			})
+
+		if m.distributeCACert && (shouldLead || configCluster) {
+			if features.EnableClusterTrustBundles {
+				// Block server exit on graceful termination of the leader controller.
+				m.s.RunComponentAsyncAndWait("clustertrustbundle controller", func(_ <-chan struct{}) error {
+					log.Infof("joining leader-election for %s in %s on cluster %s",
+						leaderelection.ClusterTrustBundleController, options.SystemNamespace, options.ClusterID)
+					election := leaderelection.
+						NewLeaderElectionMulticluster(options.SystemNamespace, m.serverID, leaderelection.NamespaceController, m.revision, !configCluster, client).
+						AddRunFunction(func(leaderStop <-chan struct{}) {
+							log.Infof("starting clustertrustbundle controller for cluster %s", cluster.ID)
+							c := clustertrustbundle.NewController(client, m.caBundleWatcher)
+							client.RunAndWait(clusterStopCh)
+							c.Run(leaderStop)
+						})
+					election.Run(clusterStopCh)
+					return nil
+				})
+			} else {
+				// Block server exit on graceful termination of the leader controller.
+				m.s.RunComponentAsyncAndWait("namespace controller", func(_ <-chan struct{}) error {
+					log.Infof("joining leader-election for %s in %s on cluster %s",
+						leaderelection.NamespaceController, options.SystemNamespace, options.ClusterID)
+					election := leaderelection.
+						NewLeaderElectionMulticluster(options.SystemNamespace, m.serverID, leaderelection.NamespaceController, m.revision, !configCluster, client).
+						AddRunFunction(func(leaderStop <-chan struct{}) {
+							log.Infof("starting namespace controller for cluster %s", cluster.ID)
+							nc := NewNamespaceController(client, m.caBundleWatcher)
+							// Start informers again. This fixes the case where informers for namespace do not start,
+							// as we create them only after acquiring the leader lock
+							// Note: stop here should be the overall pilot stop, NOT the leader election stop. We are
+							// basically lazy loading the informer, if we stop it when we lose the lock we will never
+							// recreate it again.
+							client.RunAndWait(clusterStopCh)
+							nc.Run(leaderStop)
+						})
+					election.Run(clusterStopCh)
+					return nil
+				})
+			}
 		}
 		// Set up injection webhook patching for remote clusters we are controlling.
 		// The config cluster has this patching set up elsewhere. We may eventually want to move it here.
@@ -296,6 +425,11 @@ func createWleConfigStore(client kubelib.Client, revision string, opts Options) 
 	workloadEntriesSchemas := collection.NewSchemasBuilder().
 		MustAdd(collections.WorkloadEntry).
 		Build()
-	crdOpts := crdclient.Option{Revision: revision, DomainSuffix: opts.DomainSuffix, Identifier: "mc-workload-entry-controller"}
+	crdOpts := crdclient.Option{
+		Revision:     revision,
+		DomainSuffix: opts.DomainSuffix,
+		Identifier:   "mc-workload-entry-controller",
+		KrtDebugger:  opts.KrtDebugger,
+	}
 	return crdclient.NewForSchemas(client, crdOpts, workloadEntriesSchemas)
 }

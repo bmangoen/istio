@@ -52,7 +52,7 @@ func EqualUnordered[E comparable](s1, s2 []E) bool {
 // EqualFunc returns false. Otherwise, the elements are compared in
 // increasing index order, and the comparison stops at the first index
 // for which eq returns false.
-func EqualFunc[E1, E2 comparable](s1 []E1, s2 []E2, eq func(E1, E2) bool) bool {
+func EqualFunc[E1, E2 any](s1 []E1, s2 []E2, eq func(E1, E2) bool) bool {
 	return slices.EqualFunc(s1, s2, eq)
 }
 
@@ -118,6 +118,11 @@ func Contains[E comparable](s []E, v E) bool {
 	return slices.Contains(s, v)
 }
 
+// ContainsFunc reports whether at least one element of s satisfies f.
+func ContainsFunc[E any](s []E, f func(E) bool) bool {
+	return slices.ContainsFunc(s, f)
+}
+
 // Max returns the maximal value in x. It panics if x is empty.
 // For floating-point E, Max propagates NaNs (any NaN value in x
 // forces the output to be NaN).
@@ -150,6 +155,12 @@ func MinFunc[S ~[]E, E any](x S, cmp func(a, b E) int) E {
 // or -1 if not present.
 func Index[S ~[]E, E comparable](s S, v E) int {
 	return slices.Index(s, v)
+}
+
+// IndexFunc returns the first index i satisfying f(s[i]),
+// or -1 if none do.
+func IndexFunc[S ~[]E, E any](s S, f func(E) bool) int {
+	return slices.IndexFunc(s, f)
 }
 
 // FindFunc finds the first element matching the function, or nil if none do

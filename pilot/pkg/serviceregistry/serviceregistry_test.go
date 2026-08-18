@@ -44,7 +44,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
-	xds "istio.io/istio/pilot/test/xds"
+	"istio.io/istio/pilot/test/xds"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
@@ -53,7 +53,10 @@ import (
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	kubeclient "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/maps"
+	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/slices"
 	istiotest "istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
@@ -83,7 +86,15 @@ func setupTest(t *testing.T) (model.ConfigStoreController, kubernetes.Interface,
 	stop := istiotest.NewStop(t)
 	go configController.Run(stop)
 
-	se := serviceentry.NewController(configController, xdsUpdater, meshWatcher)
+	multiclusterController := multicluster.NewController(multicluster.ControllerOptions{
+		Client:          client,
+		ClusterID:       client.ClusterID(),
+		SystemNamespace: meshWatcher.Mesh().RootNamespace,
+		MeshConfig:      meshWatcher,
+		Debugger:        krt.GlobalDebugHandler,
+	})
+	assert.NoError(t, multiclusterController.Run(stop))
+	se := serviceentry.NewController(configController, xdsUpdater, multiclusterController, meshWatcher)
 	client.RunAndWait(stop)
 
 	kc.AppendWorkloadHandler(se.WorkloadInstanceHandler)
@@ -245,11 +256,11 @@ func TestWorkloadInstances(t *testing.T) {
 		createEndpoints(t, kube, service.Name, namespace, []v1.EndpointPort{{Name: "http", Port: 80}}, []string{pod.Status.PodIP})
 		fx.WaitOrFail(t, "eds")
 		// Endpoint update is triggered since its a brand new service
-		if ev := fx.WaitOrFail(t, "xds full"); !ev.Reason.Has(model.EndpointUpdate) {
+		if ev := fx.WaitOrFail(t, "xds"); !ev.Reason.Has(model.EndpointUpdate) {
 			t.Fatalf("xds push reason does not contain %v: %v", model.EndpointUpdate, ev)
 		}
 		// headless service update must trigger nds push, so we trigger a full push.
-		if ev := fx.WaitOrFail(t, "xds full"); !ev.Reason.Has(model.HeadlessEndpointUpdate) {
+		if ev := fx.WaitOrFail(t, "xds"); !ev.Reason.Has(model.HeadlessEndpointUpdate) {
 			t.Fatalf("xds push reason does not contain %v: %v", model.HeadlessEndpointUpdate, ev)
 		}
 
@@ -270,11 +281,11 @@ func TestWorkloadInstances(t *testing.T) {
 		createEndpoints(t, kube, service.Name, namespace, []v1.EndpointPort{{Name: "tcp", Port: 70}}, []string{pod.Status.PodIP})
 		fx.WaitOrFail(t, "eds")
 		// Endpoint update is triggered since its a brand new service
-		if ev := fx.WaitOrFail(t, "xds full"); !ev.Reason.Has(model.EndpointUpdate) {
+		if ev := fx.WaitOrFail(t, "xds"); !ev.Reason.Has(model.EndpointUpdate) {
 			t.Fatalf("xds push reason does not contain %v: %v", model.EndpointUpdate, ev)
 		}
 		// headless service update must trigger nds push, so we trigger a full push.
-		if ev := fx.WaitOrFail(t, "xds full"); !ev.Reason.Has(model.HeadlessEndpointUpdate) {
+		if ev := fx.WaitOrFail(t, "xds"); !ev.Reason.Has(model.HeadlessEndpointUpdate) {
 			t.Fatalf("xds push reason does not contain %v: %v", model.HeadlessEndpointUpdate, ev)
 		}
 		instances := []EndpointResponse{{
@@ -496,7 +507,7 @@ func TestWorkloadInstances(t *testing.T) {
 			},
 		})
 		makeIstioObject(t, store, workloadEntry)
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 
 		instances := []EndpointResponse{{
 			Address: workloadEntry.Spec.(*networking.WorkloadEntry).Address,
@@ -584,7 +595,7 @@ func TestWorkloadInstances(t *testing.T) {
 		}
 		makeIstioObject(t, store, we1)
 		makeIstioObject(t, store, we2)
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 
 		instances := []EndpointResponse{{
 			Address: workloadEntry.Spec.(*networking.WorkloadEntry).Address,
@@ -689,7 +700,7 @@ func TestWorkloadInstances(t *testing.T) {
 		}
 		makeIstioObject(t, store, we1)
 		makeIstioObject(t, store, we2)
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 
 		instances := []EndpointResponse{{
 			Address: workloadEntry.Spec.(*networking.WorkloadEntry).Address,
@@ -1149,7 +1160,7 @@ func TestWorkloadInstances(t *testing.T) {
 			},
 		})
 
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 		instances := []EndpointResponse{{
 			Address: "2.3.4.5",
 			Port:    80,
@@ -1257,7 +1268,7 @@ func TestWorkloadInstances(t *testing.T) {
 			},
 		})
 
-		fx.WaitOrFail(t, "xds full")
+		fx.WaitOrFail(t, "xds")
 		expectedSvc := &model.Service{
 			Hostname: "service.namespace.svc.cluster.local",
 			Ports: []*model.Port{
@@ -1530,12 +1541,12 @@ func setHealth(cfg config.Config, healthy bool) config.Config {
 	}
 	cfg.Annotations[status.WorkloadEntryHealthCheckAnnotation] = "true"
 	if healthy {
-		return status.UpdateConfigCondition(cfg, &v1alpha1.IstioCondition{
+		return status.UpdateIstioConfigCondition(cfg, &v1alpha1.IstioCondition{
 			Type:   status.ConditionHealthy,
 			Status: status.StatusTrue,
 		})
 	}
-	return status.UpdateConfigCondition(cfg, &v1alpha1.IstioCondition{
+	return status.UpdateIstioConfigCondition(cfg, &v1alpha1.IstioCondition{
 		Type:   status.ConditionHealthy,
 		Status: status.StatusFalse,
 	})
@@ -1900,7 +1911,7 @@ func TestLocality(t *testing.T) {
 	namespace := "default"
 	basePod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "pod",
+			Name:      "test-1",
 			Namespace: namespace,
 			Labels:    map[string]string{},
 		},
@@ -1934,7 +1945,7 @@ func TestLocality(t *testing.T) {
 			name: "pod specific label",
 			pod: func() *v1.Pod {
 				p := basePod.DeepCopy()
-				p.Labels[model.LocalityLabel] = "r.z.s"
+				p.Labels[pm.LocalityLabel] = "r.z.s"
 				return p
 			}(),
 			node: baseNode,
@@ -1964,7 +1975,7 @@ func TestLocality(t *testing.T) {
 			name: "pod and node labels",
 			pod: func() *v1.Pod {
 				p := basePod.DeepCopy()
-				p.Labels[model.LocalityLabel] = "r.z.s"
+				p.Labels[pm.LocalityLabel] = "r.z.s"
 				return p
 			}(),
 			node: func() *v1.Node {
@@ -2018,7 +2029,7 @@ func TestLocality(t *testing.T) {
 					Endpoints: []*networking.WorkloadEntry{{
 						Address: "1.2.3.4",
 						Labels: map[string]string{
-							model.LocalityLabel: "r.z.s",
+							pm.LocalityLabel: "r.z.s",
 						},
 					}},
 					Resolution: networking.ServiceEntry_STATIC,
@@ -2045,7 +2056,7 @@ func TestLocality(t *testing.T) {
 						Address:  "1.2.3.4",
 						Locality: "r/z/s",
 						Labels: map[string]string{
-							model.LocalityLabel: "lr.lz.ls",
+							pm.LocalityLabel: "lr.lz.ls",
 						},
 					}},
 					Resolution: networking.ServiceEntry_STATIC,
@@ -2061,8 +2072,10 @@ func TestLocality(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := xds.FakeOptions{}
+			proxyName := ""
 			if tt.pod != nil {
 				opts.KubernetesObjects = append(opts.KubernetesObjects, tt.pod)
+				proxyName = tt.pod.Name + "." + tt.pod.Namespace
 			}
 			if tt.node != nil {
 				opts.KubernetesObjects = append(opts.KubernetesObjects, tt.node)
@@ -2071,7 +2084,7 @@ func TestLocality(t *testing.T) {
 				opts.Configs = append(opts.Configs, tt.obj)
 			}
 			s := xds.NewFakeDiscoveryServer(t, opts)
-			s.Connect(s.SetupProxy(&model.Proxy{IPAddresses: []string{"1.2.3.4"}}), nil, []string{v3.ClusterType})
+			s.Connect(s.SetupProxy(&model.Proxy{ID: proxyName, IPAddresses: []string{"1.2.3.4"}}), nil, []string{v3.ClusterType})
 			retry.UntilSuccessOrFail(t, func() error {
 				clients := s.Discovery.AllClients()
 				if len(clients) != 1 {

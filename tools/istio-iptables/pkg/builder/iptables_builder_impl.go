@@ -22,7 +22,7 @@ import (
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
-	"istio.io/istio/tools/istio-iptables/pkg/config"
+	"istio.io/istio/tools/common/config"
 	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
 
@@ -45,7 +45,7 @@ type IptablesRuleBuilder struct {
 	cfg   *config.Config
 }
 
-// NewIptablesBuilders creates a new IptablesRuleBuilder
+// NewIptablesRuleBuilder creates a new IptablesRuleBuilder
 func NewIptablesRuleBuilder(cfg *config.Config) *IptablesRuleBuilder {
 	if cfg == nil {
 		cfg = &config.Config{}
@@ -138,7 +138,7 @@ func (rb *IptablesRuleBuilder) buildRules(rules []Rule) [][]string {
 		// Create new chain if key: `chainTable` isn't present in map
 		if !chainTableLookupSet.Contains(chainTable) {
 			// Ignore chain creation for built-in chains for iptables
-			if !constants.BuiltInChainsMap.Contains(r.chain) {
+			if !constants.BuiltInChainsAndTargetsMap.Contains(r.chain) {
 				cmd := []string{"-t", r.table, "-N", r.chain}
 				output = append(output, cmd)
 				chainTableLookupSet.Insert(chainTable)
@@ -181,7 +181,7 @@ func (rb *IptablesRuleBuilder) buildCleanupRules(rules []Rule) [][]string {
 		// Delete chain if key: `chainTable` isn't present in map
 		if !chainTableLookupSet.Contains(chainTable) {
 			// Don't delete iptables built-in chains
-			if !constants.BuiltInChainsMap.Contains(r.chain) {
+			if !constants.BuiltInChainsAndTargetsMap.Contains(r.chain) {
 				cmd := []string{"-t", r.table, "-F", r.chain}
 				output = append(output, cmd)
 				cmd = []string{"-t", r.table, "-X", r.chain}
@@ -276,7 +276,7 @@ func (rb *IptablesRuleBuilder) buildRestore(rules []Rule) string {
 		// Create new chain if key: `chainTable` isn't present in map
 		if !chainTableLookupMap.InsertContains(chainTable) {
 			// Ignore chain creation for built-in chains for iptables
-			if !constants.BuiltInChainsMap.Contains(r.chain) {
+			if !constants.BuiltInChainsAndTargetsMap.Contains(r.chain) {
 				tableRulesMap[r.table] = append(tableRulesMap[r.table], fmt.Sprintf("-N %s", r.chain))
 			}
 		}
@@ -284,13 +284,13 @@ func (rb *IptablesRuleBuilder) buildRestore(rules []Rule) string {
 	// Also look for chains we jump to, even if we have no rules in them
 	for _, r := range rules {
 		if len(r.params) >= 2 && r.params[len(r.params)-2] == "-j" {
-			chain := r.params[len(r.params)-1]
-			chainTable := fmt.Sprintf("%s:%s", chain, r.table)
+			jumpTarget := r.params[len(r.params)-1]
+			chainTable := fmt.Sprintf("%s:%s", jumpTarget, r.table)
 			// Create new chain if key: `chainTable` isn't present in map
 			if !chainTableLookupMap.InsertContains(chainTable) {
 				// Ignore chain creation for built-in chains for iptables
-				if !constants.BuiltInChainsMap.Contains(chain) {
-					tableRulesMap[r.table] = append(tableRulesMap[r.table], fmt.Sprintf("-N %s", chain))
+				if !constants.BuiltInChainsAndTargetsMap.Contains(jumpTarget) {
+					tableRulesMap[r.table] = append(tableRulesMap[r.table], fmt.Sprintf("-N %s", jumpTarget))
 				}
 			}
 		}
@@ -310,7 +310,7 @@ func (rb *IptablesRuleBuilder) BuildV6Restore() string {
 	return rb.buildRestore(rb.rules.rulesv6)
 }
 
-// getStateFromSave function takes a string in iptables-restore format and returns a map of the tables, chains, and rules.
+// GetStateFromSave function takes a string in iptables-restore format and returns a map of the tables, chains, and rules.
 // Note that if this function is used to parse iptables-save output, the rules may have changed since they were first applied
 // as rules do not necessarily undergo a round-trip through the kernel in the same form.
 // Therefore, these rules should not be used for any critical checks.

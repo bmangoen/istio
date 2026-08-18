@@ -77,7 +77,7 @@ func GenerateManifest(files []string, setFlags []string, force bool, client kube
 			// Each component may get a different view of the values; modify them as needed (with a copy)
 			compVals := applyComponentValuesToHelmValues(comp, spec, merged)
 			// Render the chart
-			rendered, warnings, err := helm.Render(spec.Namespace, comp.HelmSubdir, compVals, kubernetesVersion)
+			rendered, warnings, err := helm.Render("istio", spec.Namespace, comp.HelmSubdir, compVals, kubernetesVersion)
 			if err != nil {
 				return nil, nil, fmt.Errorf("helm render: %v", err)
 			}
@@ -162,7 +162,7 @@ func Migrate(files []string, setFlags []string, client kube.Client) (MigrationRe
 			// Each component may get a different view of the values; modify them as needed (with a copy)
 			compVals := applyComponentValuesToHelmValues(comp, spec, merged)
 			// Render the chart
-			rendered, _, err := helm.Render(spec.Namespace, comp.HelmSubdir, compVals, kubernetesVersion)
+			rendered, _, err := helm.Render("istio", spec.Namespace, comp.HelmSubdir, compVals, kubernetesVersion)
 			if err != nil {
 				return res, fmt.Errorf("helm render: %v", err)
 			}
@@ -193,6 +193,40 @@ func applyComponentValuesToHelmValues(comp component.Component, spec apis.Gatewa
 			var ports []map[string]any
 			_ = json.Unmarshal(b, &ports)
 			_ = merged.SetPath(fmt.Sprintf("spec.values.%s.ports", root), ports)
+		}
+	}
+	// For Deployment-based components, translate k8s HPA/replica settings to Helm
+	// values so that template guard conditions (e.g. PDB requiring autoscaleMin > 1)
+	// see them. Without this, k8s.hpaSpec.minReplicas only patches the HPA
+	// post-render and the PDB is never generated. DaemonSet components (CNI,
+	// ztunnel) have no autoscaling, so we skip them.
+	if comp.ResourceType == "Deployment" && spec.Kubernetes != nil {
+		if !comp.IsGateway() {
+			merged = merged.DeepClone()
+		}
+		if spec.Kubernetes.HpaSpec != nil {
+			if spec.Kubernetes.HpaSpec.MinReplicas != nil {
+				_ = merged.SetPath(fmt.Sprintf("spec.values.%s.autoscaleMin", root), int64(*spec.Kubernetes.HpaSpec.MinReplicas))
+			}
+			if spec.Kubernetes.HpaSpec.MaxReplicas > 0 {
+				_ = merged.SetPath(fmt.Sprintf("spec.values.%s.autoscaleMax", root), int64(spec.Kubernetes.HpaSpec.MaxReplicas))
+			}
+		}
+		if spec.Kubernetes.ReplicaCount > 0 {
+			_ = merged.SetPath(fmt.Sprintf("spec.values.%s.replicaCount", root), int64(spec.Kubernetes.ReplicaCount))
+		}
+	}
+	// Translate k8s.resources CPU into Helm values so chart guard conditions (e.g.
+	// ztunnel's ZTUNNEL_RESOURCE_CPU_* env vars) see operator-set resources. Without
+	// this, k8s.resources only patches the container post-render and is invisible at
+	// template time, so the guards would never fire on the istioctl/operator path.
+	if spec.Kubernetes != nil && spec.Kubernetes.Resources != nil {
+		merged = merged.DeepClone()
+		if cpu := spec.Kubernetes.Resources.Limits.Cpu(); !cpu.IsZero() {
+			_ = merged.SetPath(fmt.Sprintf("spec.values.%s.resources.limits.cpu", root), cpu.String())
+		}
+		if cpu := spec.Kubernetes.Resources.Requests.Cpu(); !cpu.IsZero() {
+			_ = merged.SetPath(fmt.Sprintf("spec.values.%s.resources.requests.cpu", root), cpu.String())
 		}
 	}
 	// No changes needed, skip early to avoid copy

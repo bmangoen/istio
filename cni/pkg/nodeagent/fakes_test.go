@@ -19,12 +19,14 @@ import (
 	"embed"
 	"errors"
 	"io/fs"
+	"strings"
 	"sync/atomic"
 	"syscall"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"istio.io/istio/cni/pkg/config"
 	"istio.io/istio/cni/pkg/iptables"
 )
 
@@ -91,7 +93,7 @@ func (f *fakeNs) Close() error {
 	return nil
 }
 
-func fakeFs(uniqueInos bool) fs.FS {
+func fakeFs(uniqueInos bool) *fakeFsWithFakeFds {
 	subFs, err := fs.Sub(fakeProc, "testdata")
 	if err != nil {
 		panic(err)
@@ -103,10 +105,20 @@ func fakeFs(uniqueInos bool) fs.FS {
 	return &fakeFsWithFakeFds{ReadDirFS: subFs.(fs.ReadDirFS), uniqueInos: uniqueInos}
 }
 
+// fakeFsWithNetnsInos is fakeFs(true) with fixed inodes for the given paths
+// (e.g. "3/ns/net"), letting tests model processes that share a netns.
+func fakeFsWithNetnsInos(inos map[string]int) *fakeFsWithFakeFds {
+	ffs := fakeFs(true)
+	ffs.inos = inos
+	return ffs
+}
+
 type fakeFsWithFakeFds struct {
 	fs.ReadDirFS
 	inoCounter int
 	uniqueInos bool
+	inos       map[string]int
+	opened     []*fakeFileFakeFds
 }
 
 // Open opens the named file.
@@ -125,17 +137,41 @@ func (ffs *fakeFsWithFakeFds) Open(name string) (fs.File, error) {
 	if ffs.uniqueInos {
 		ffs.inoCounter++
 	}
-	return wrapFile(f, ffs.inoCounter), nil
+	ino := ffs.inoCounter
+	if override, ok := ffs.inos[name]; ok {
+		ino = override
+	}
+	wrapped := wrapFile(name, f, ino)
+	ffs.opened = append(ffs.opened, wrapped)
+	return wrapped, nil
 }
 
-func wrapFile(f fs.File, ino int) fs.File {
-	return &fakeFileFakeFds{File: f, fd: 0, ino: ino}
+// openNetnsFiles returns how many netns files handed out so far have not been closed.
+func (ffs *fakeFsWithFakeFds) openNetnsFiles() int {
+	open := 0
+	for _, f := range ffs.opened {
+		if strings.HasSuffix(f.name, "ns/net") && !f.closed {
+			open++
+		}
+	}
+	return open
+}
+
+func wrapFile(name string, f fs.File, ino int) *fakeFileFakeFds {
+	return &fakeFileFakeFds{File: f, name: name, fd: 0, ino: ino}
 }
 
 type fakeFileFakeFds struct {
 	fs.File
-	fd  uintptr
-	ino int
+	name   string
+	fd     uintptr
+	ino    int
+	closed bool
+}
+
+func (f *fakeFileFakeFds) Close() error {
+	f.closed = true
+	return f.File.Close()
 }
 
 func (f *fakeFileFakeFds) Fd() uintptr {
@@ -169,22 +205,22 @@ type fakeIptablesDeps struct {
 
 var _ iptables.NetlinkDependencies = &fakeIptablesDeps{}
 
-func (r *fakeIptablesDeps) AddInpodMarkIPRule(cfg *iptables.IptablesConfig) error {
+func (r *fakeIptablesDeps) AddInpodMarkIPRule(cfg *config.AmbientConfig) error {
 	r.AddInpodMarkIPRuleCnt.Add(1)
 	return nil
 }
 
-func (r *fakeIptablesDeps) DelInpodMarkIPRule(cfg *iptables.IptablesConfig) error {
+func (r *fakeIptablesDeps) DelInpodMarkIPRule(cfg *config.AmbientConfig) error {
 	r.DelInpodMarkIPRuleCnt.Add(1)
 	return nil
 }
 
-func (r *fakeIptablesDeps) AddLoopbackRoutes(cfg *iptables.IptablesConfig) error {
+func (r *fakeIptablesDeps) AddLoopbackRoutes(cfg *config.AmbientConfig) error {
 	r.AddLoopbackRoutesCnt.Add(1)
 	return r.AddRouteErr
 }
 
-func (r *fakeIptablesDeps) DelLoopbackRoutes(cfg *iptables.IptablesConfig) error {
+func (r *fakeIptablesDeps) DelLoopbackRoutes(cfg *config.AmbientConfig) error {
 	r.DelLoopbackRoutesCnt.Add(1)
 	return nil
 }

@@ -200,10 +200,10 @@ func TestNameTable(t *testing.T) {
 			ServiceRegistry: provider.External,
 		},
 	}
-	serviceWithVIP2 := serviceWithVIP1.DeepCopy()
+	serviceWithVIP2 := serviceWithVIP1.ShallowCopy()
 	serviceWithVIP2.DefaultAddress = "10.0.0.6"
 
-	decoratedService := serviceWithVIP1.DeepCopy()
+	decoratedService := serviceWithVIP1.ShallowCopy()
 	decoratedService.DefaultAddress = "10.0.0.7"
 	decoratedService.Attributes.ServiceRegistry = provider.Kubernetes
 
@@ -652,7 +652,7 @@ func TestNameTable(t *testing.T) {
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.proxy.SidecarScope = model.DefaultSidecarScopeForNamespace(tt.push, "default")
+			tt.proxy.SetSidecarScope(tt.push)
 			tt.proxy.DiscoverIPMode()
 			if diff := cmp.Diff(dnsServer.BuildNameTable(dnsServer.Config{
 				Node:                        tt.proxy,
@@ -694,4 +694,265 @@ func makeInstances(proxy *model.Proxy, svc *model.Service, servicePort int, targ
 		})
 	}
 	return ret
+}
+
+func TestMultiPortHeadlessServiceSplitEndpointSlices(t *testing.T) {
+	mesh := &meshconfig.MeshConfig{RootNamespace: "istio-system"}
+
+	multiPortHeadlessService := &model.Service{
+		Hostname:       host.Name("kafka-brokers.kafka.svc.cluster.local"),
+		DefaultAddress: constants.UnspecifiedIP,
+		Ports: model.PortList{
+			{Name: "tcp-ctrlplane", Port: 9090, Protocol: protocol.TCP},
+			{Name: "tcp-replication", Port: 9091, Protocol: protocol.TCP},
+			{Name: "tcp-kafkaagent", Port: 8443, Protocol: protocol.TCP},
+			{Name: "tcp-clientstls", Port: 9093, Protocol: protocol.TCP},
+		},
+		Resolution: model.Passthrough,
+		Attributes: model.ServiceAttributes{
+			Name:            "kafka-brokers",
+			Namespace:       "kafka",
+			ServiceRegistry: provider.Kubernetes,
+		},
+	}
+
+	controllerProxy := &model.Proxy{
+		IPAddresses: []string{"10.0.1.1"},
+		Metadata:    &model.NodeMetadata{ClusterID: "cluster1"},
+		Type:        model.SidecarProxy,
+		DNSDomain:   "kafka.svc.cluster.local",
+	}
+	brokerProxy := &model.Proxy{
+		IPAddresses: []string{"10.0.2.1"},
+		Metadata:    &model.NodeMetadata{ClusterID: "cluster1"},
+		Type:        model.SidecarProxy,
+		DNSDomain:   "kafka.svc.cluster.local",
+	}
+	remoteProxy := &model.Proxy{
+		IPAddresses: []string{"10.1.0.1"},
+		Metadata:    &model.NodeMetadata{ClusterID: "cluster2"},
+		Type:        model.SidecarProxy,
+		DNSDomain:   "kafka.svc.cluster.local",
+	}
+
+	push := model.NewPushContext()
+	push.Mesh = mesh
+	push.AddPublicServices([]*model.Service{multiPortHeadlessService})
+
+	controllerInstances := map[int][]*model.IstioEndpoint{
+		9090: {{
+			Addresses:       controllerProxy.IPAddresses,
+			ServicePortName: "tcp-ctrlplane",
+			EndpointPort:    9090,
+			HostName:        "controller-0",
+			SubDomain:       "kafka-brokers",
+			HealthStatus:    model.Healthy,
+			Locality:        model.Locality{ClusterID: "cluster1"},
+		}},
+		8443: {{
+			Addresses:       controllerProxy.IPAddresses,
+			ServicePortName: "tcp-kafkaagent",
+			EndpointPort:    8443,
+			HostName:        "controller-0",
+			SubDomain:       "kafka-brokers",
+			HealthStatus:    model.Healthy,
+			Locality:        model.Locality{ClusterID: "cluster1"},
+		}},
+	}
+	push.AddServiceInstances(multiPortHeadlessService, controllerInstances)
+
+	// Broker has no endpoints on port 9090 (Ports[0]).
+	brokerInstances := map[int][]*model.IstioEndpoint{
+		9091: {{
+			Addresses:       brokerProxy.IPAddresses,
+			ServicePortName: "tcp-replication",
+			EndpointPort:    9091,
+			HostName:        "kafka-0",
+			SubDomain:       "kafka-brokers",
+			HealthStatus:    model.Healthy,
+			Locality:        model.Locality{ClusterID: "cluster1"},
+		}},
+		9093: {{
+			Addresses:       brokerProxy.IPAddresses,
+			ServicePortName: "tcp-clientstls",
+			EndpointPort:    9093,
+			HostName:        "kafka-0",
+			SubDomain:       "kafka-brokers",
+			HealthStatus:    model.Healthy,
+			Locality:        model.Locality{ClusterID: "cluster1"},
+		}},
+		8443: {{
+			Addresses:       brokerProxy.IPAddresses,
+			ServicePortName: "tcp-kafkaagent",
+			EndpointPort:    8443,
+			HostName:        "kafka-0",
+			SubDomain:       "kafka-brokers",
+			HealthStatus:    model.Healthy,
+			Locality:        model.Locality{ClusterID: "cluster1"},
+		}},
+	}
+	push.AddServiceInstances(multiPortHeadlessService, brokerInstances)
+
+	cases := []struct {
+		name                string
+		proxy               *model.Proxy
+		expectBrokerDNS     bool
+		expectControllerDNS bool
+	}{
+		{
+			name:                "local cluster sees both controller and broker",
+			proxy:               controllerProxy,
+			expectBrokerDNS:     true,
+			expectControllerDNS: true,
+		},
+		{
+			name:                "remote cluster sees both controller and broker",
+			proxy:               remoteProxy,
+			expectBrokerDNS:     true,
+			expectControllerDNS: true,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.proxy.SetSidecarScope(push)
+			tt.proxy.DiscoverIPMode()
+
+			nt := dnsServer.BuildNameTable(dnsServer.Config{
+				Node:                        tt.proxy,
+				Push:                        push,
+				MulticlusterHeadlessEnabled: true,
+			})
+
+			brokerEntry := "kafka-0.kafka-brokers.kafka.svc.cluster.local"
+			controllerEntry := "controller-0.kafka-brokers.kafka.svc.cluster.local"
+
+			if tt.expectBrokerDNS {
+				if _, found := nt.Table[brokerEntry]; !found {
+					t.Errorf("expected broker DNS entry %q but it was missing from name table (keys: %v)",
+						brokerEntry, nameTableKeys(nt))
+				}
+			}
+			if tt.expectControllerDNS {
+				if _, found := nt.Table[controllerEntry]; !found {
+					t.Errorf("expected controller DNS entry %q but it was missing from name table (keys: %v)",
+						controllerEntry, nameTableKeys(nt))
+				}
+			}
+		})
+	}
+}
+
+func nameTableKeys(nt *dnsProto.NameTable) []string {
+	keys := make([]string, 0, len(nt.Table))
+	for k := range nt.Table {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func TestPodNameTableLocalRemoteAddresses(t *testing.T) {
+	mesh := &meshconfig.MeshConfig{RootNamespace: "istio-system"}
+
+	headlessService := &model.Service{
+		Hostname:       host.Name("headless-svc.testns.svc.cluster.local"),
+		DefaultAddress: constants.UnspecifiedIP,
+		Ports: model.PortList{&model.Port{
+			Name:     "tcp-port",
+			Port:     9000,
+			Protocol: protocol.TCP,
+		}},
+		Resolution: model.Passthrough,
+		Attributes: model.ServiceAttributes{
+			Name:            "headless-svc",
+			Namespace:       "testns",
+			ServiceRegistry: provider.Kubernetes,
+		},
+	}
+
+	cases := []struct {
+		name          string
+		proxyCluster  cluster.ID
+		instances     []*model.Proxy
+		expectedEntry string
+		expectedIPs   []string
+	}{
+		{
+			name:         "cumulative IPs for same pod in local cluster",
+			proxyCluster: "cluster1",
+			instances: []*model.Proxy{
+				{IPAddresses: []string{"10.0.0.1"}, Metadata: &model.NodeMetadata{ClusterID: "cluster1"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+				{IPAddresses: []string{"10.0.0.2"}, Metadata: &model.NodeMetadata{ClusterID: "cluster1"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+			},
+			expectedEntry: "mysql-0.headless-svc.testns.svc.cluster.local",
+			expectedIPs:   []string{"10.0.0.1", "10.0.0.2"},
+		},
+		{
+			name:         "cumulative IPs for same pod in remote cluster",
+			proxyCluster: "cluster1",
+			instances: []*model.Proxy{
+				{IPAddresses: []string{"10.0.0.3"}, Metadata: &model.NodeMetadata{ClusterID: "cluster2"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+				{IPAddresses: []string{"10.0.0.4"}, Metadata: &model.NodeMetadata{ClusterID: "cluster2"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+			},
+			expectedEntry: "mysql-0.headless-svc.testns.svc.cluster.local",
+			expectedIPs:   []string{"10.0.0.3", "10.0.0.4"},
+		},
+		{
+			name:         "local cluster preferred over remote",
+			proxyCluster: "cluster1",
+			instances: []*model.Proxy{
+				{IPAddresses: []string{"10.0.0.1"}, Metadata: &model.NodeMetadata{ClusterID: "cluster1"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+				{IPAddresses: []string{"10.0.0.2"}, Metadata: &model.NodeMetadata{ClusterID: "cluster2"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+			},
+			expectedEntry: "mysql-0.headless-svc.testns.svc.cluster.local",
+			expectedIPs:   []string{"10.0.0.1"},
+		},
+		{
+			name:         "multiple local instances preferred over multiple remote",
+			proxyCluster: "cluster1",
+			instances: []*model.Proxy{
+				{IPAddresses: []string{"10.0.0.1"}, Metadata: &model.NodeMetadata{ClusterID: "cluster1"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+				{IPAddresses: []string{"10.0.0.2"}, Metadata: &model.NodeMetadata{ClusterID: "cluster1"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+				{IPAddresses: []string{"10.0.0.3"}, Metadata: &model.NodeMetadata{ClusterID: "cluster2"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+				{IPAddresses: []string{"10.0.0.4"}, Metadata: &model.NodeMetadata{ClusterID: "cluster2"}, Type: model.SidecarProxy, DNSDomain: "testns.svc.cluster.local"},
+			},
+			expectedEntry: "mysql-0.headless-svc.testns.svc.cluster.local",
+			expectedIPs:   []string{"10.0.0.1", "10.0.0.2"},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			push := model.NewPushContext()
+			push.Mesh = mesh
+			push.AddPublicServices([]*model.Service{headlessService})
+			for _, inst := range tt.instances {
+				push.AddServiceInstances(headlessService,
+					makeServiceInstances(inst, headlessService, "mysql-0", "headless-svc", model.Healthy))
+			}
+
+			proxy := &model.Proxy{
+				IPAddresses: []string{"9.9.9.9"},
+				Metadata:    &model.NodeMetadata{ClusterID: tt.proxyCluster},
+				Type:        model.SidecarProxy,
+				DNSDomain:   "testns.svc.cluster.local",
+			}
+			proxy.SetSidecarScope(push)
+			proxy.DiscoverIPMode()
+
+			nameTable := dnsServer.BuildNameTable(dnsServer.Config{
+				Node:                        proxy,
+				Push:                        push,
+				MulticlusterHeadlessEnabled: true,
+			})
+
+			entry, found := nameTable.Table[tt.expectedEntry]
+			if !found {
+				t.Fatalf("Expected entry %s not found", tt.expectedEntry)
+			}
+			if diff := cmp.Diff(entry.Ips, tt.expectedIPs); diff != "" {
+				t.Errorf("IPs mismatch (-got +want):\n%s", diff)
+			}
+		})
+	}
 }

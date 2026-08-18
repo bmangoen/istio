@@ -85,12 +85,12 @@ func (esc *endpointSliceController) initializeNamespace(ns string, filtered bool
 	return err.ErrorOrNil()
 }
 
-func (esc *endpointSliceController) onEvent(_, ep *v1.EndpointSlice, event model.Event) error {
-	esc.onEventInternal(nil, ep, event)
+func (esc *endpointSliceController) onEvent(old, ep *v1.EndpointSlice, event model.Event) error {
+	esc.onEventInternal(old, ep, event)
 	return nil
 }
 
-func (esc *endpointSliceController) onEventInternal(_, ep *v1.EndpointSlice, event model.Event) {
+func (esc *endpointSliceController) onEventInternal(old, ep *v1.EndpointSlice, event model.Event) {
 	esLabels := ep.GetLabels()
 	if !endpointSliceSelector.Matches(klabels.Set(esLabels)) {
 		return
@@ -102,6 +102,9 @@ func (esc *endpointSliceController) onEventInternal(_, ep *v1.EndpointSlice, eve
 	if event == model.EventDelete {
 		esc.deleteEndpointSlice(ep)
 	} else {
+		if event == model.EventUpdate && old != nil {
+			esc.cleanupRemovedEndpoints(old, ep)
+		}
 		esc.updateEndpointSlice(ep)
 	}
 
@@ -144,7 +147,6 @@ func (esc *endpointSliceController) onEventInternal(_, ep *v1.EndpointSlice, eve
 
 	if len(configsUpdated) > 0 {
 		esc.c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{
-			Full:           true,
 			ConfigsUpdated: configsUpdated,
 			Reason:         model.NewReasonStats(model.HeadlessEndpointUpdate),
 		})
@@ -233,6 +235,26 @@ func (esc *endpointSliceController) deleteEndpointSlice(slice *v1.EndpointSlice)
 	}
 }
 
+// cleanupRemovedEndpoints calls endpointDeleted for any IP present in old but absent in cur.
+// This prevents needResync entries from leaking when an EndpointSlice UPDATE removes an address
+// (e.g. after a pod fails and is filtered from the pod cache by the FieldSelector added in #58250).
+func (esc *endpointSliceController) cleanupRemovedEndpoints(old, cur *v1.EndpointSlice) {
+	curAddrs := sets.New[string]()
+	for _, e := range cur.Endpoints {
+		for _, a := range e.Addresses {
+			curAddrs.Insert(a)
+		}
+	}
+	key := config.NamespacedName(cur)
+	for _, e := range old.Endpoints {
+		for _, a := range e.Addresses {
+			if !curAddrs.Contains(a) {
+				esc.c.pods.endpointDeleted(key, a)
+			}
+		}
+	}
+}
+
 func (esc *endpointSliceController) updateEndpointSlice(slice *v1.EndpointSlice) {
 	for _, hostname := range esc.c.hostNamesForNamespacedName(getServiceNamespacedName(slice)) {
 		esc.updateEndpointCacheForSlice(hostname, slice)
@@ -287,7 +309,7 @@ func (esc *endpointSliceController) updateEndpointCacheForSlice(hostName host.Na
 
 			var overrideAddresses []string
 			// If not expect a pod, it means this is not an endpointslice not managed by kubernetes.
-			// We donot add all pod ips to the istio endpoint.
+			// We do not add all pod ips to the istio endpoint.
 			if features.EnableDualStack && expectedPod && svcCore != nil && len(pod.Status.PodIPs) > 1 && len(svcCore.Spec.ClusterIPs) > 1 {
 				if epSlice.AddressType == v1.AddressTypeIPv6 {
 					// For endpointslice with targetRef and the pod has dual stack ip.

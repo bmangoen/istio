@@ -27,13 +27,12 @@ import (
 	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/util/workqueue"
 
-	"istio.io/api/label"
 	"istio.io/istio/cni/pkg/util"
-	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/monitoring"
+	"istio.io/istio/pkg/slices"
 )
 
 var (
@@ -51,17 +50,31 @@ type K8sHandlers interface {
 }
 
 type InformerHandlers struct {
-	ctx             context.Context
-	dataplane       MeshDataplane
-	systemNamespace string
+	ctx                context.Context
+	dataplane          MeshDataplane
+	systemNamespace    string
+	enablementSelector *util.CompiledEnablementSelectors
+	excludeNamespaces  map[string]struct{}
 
 	queue      controllers.Queue
 	pods       kclient.Client[*corev1.Pod]
 	namespaces kclient.Client[*corev1.Namespace]
 }
 
-func setupHandlers(ctx context.Context, kubeClient kube.Client, dataplane MeshDataplane, systemNamespace string) *InformerHandlers {
-	s := &InformerHandlers{ctx: ctx, dataplane: dataplane, systemNamespace: systemNamespace}
+func setupHandlers(ctx context.Context, kubeClient kube.Client, dataplane MeshDataplane,
+	systemNamespace string, enablementSelector *util.CompiledEnablementSelectors, excludeNamespaces []string,
+) *InformerHandlers {
+	nsExcludeSet := make(map[string]struct{}, len(excludeNamespaces))
+	for _, ns := range excludeNamespaces {
+		nsExcludeSet[ns] = struct{}{}
+	}
+	s := &InformerHandlers{
+		ctx:                ctx,
+		dataplane:          dataplane,
+		systemNamespace:    systemNamespace,
+		enablementSelector: enablementSelector,
+		excludeNamespaces:  nsExcludeSet,
+	}
 	s.queue = controllers.NewQueue("ambient",
 		controllers.WithGenericReconciler(s.reconcile),
 		// Effectively uncapped max attempts.
@@ -125,7 +138,7 @@ func (s *InformerHandlers) GetPodIfAmbientEnabled(podName, podNamespace string) 
 	if pod == nil {
 		return nil, fmt.Errorf("failed to find pod %v", ns)
 	}
-	if util.PodRedirectionEnabled(ns, pod) {
+	if s.enablementSelector.Matches(pod, ns.Labels) {
 		return pod, nil
 	}
 	return nil, nil
@@ -170,8 +183,10 @@ func (s *InformerHandlers) GetActiveAmbientPodSnapshot() []*corev1.Pod {
 func (s *InformerHandlers) enqueueNamespace(o controllers.Object) {
 	namespace := o.GetName()
 	labels := o.GetLabels()
-	matchAmbient := labels[label.IoIstioDataplaneMode.Name] == constants.DataplaneModeAmbient
-	if matchAmbient {
+	matchAmbient := s.enablementSelector.MatchesNamespace(labels)
+	if matchAmbient && s.isNamespaceExcluded(namespace) {
+		log.Warnf("Namespace %s is labeled for ambient mesh but is excluded by excludeNamespaces configuration; pods will not be enrolled", namespace)
+	} else if matchAmbient {
 		log.Infof("Namespace %s is enabled in ambient mesh", namespace)
 	} else {
 		log.Infof("Namespace %s is disabled from ambient mesh", namespace)
@@ -189,6 +204,11 @@ func (s *InformerHandlers) enqueueNamespace(o controllers.Object) {
 			})
 		}
 	}
+}
+
+func (s *InformerHandlers) isNamespaceExcluded(namespace string) bool {
+	_, excluded := s.excludeNamespaces[namespace]
+	return excluded
 }
 
 func (s *InformerHandlers) reconcile(input any) error {
@@ -220,18 +240,12 @@ func (s *InformerHandlers) reconcileNamespace(input any) {
 		newNs := event.New.(*corev1.Namespace)
 		oldNs := event.Old.(*corev1.Namespace)
 
-		if getModeLabel(oldNs.Labels) != getModeLabel(newNs.Labels) {
+		if s.enablementSelector.MatchesNamespace(oldNs.Labels) !=
+			s.enablementSelector.MatchesNamespace(newNs.Labels) {
 			log.Debugf("Namespace %s updated", newNs.Name)
 			s.enqueueNamespace(newNs)
 		}
 	}
-}
-
-func getModeLabel(m map[string]string) string {
-	if m == nil {
-		return ""
-	}
-	return m[label.IoIstioDataplaneMode.Name]
 }
 
 func (s *InformerHandlers) reconcilePod(input any) error {
@@ -275,10 +289,22 @@ func (s *InformerHandlers) reconcilePod(input any) error {
 		oldPod := event.Old.(*corev1.Pod)
 		isEnrolled := util.PodFullyEnrolled(currentPod)
 		isPartiallyEnrolled := util.PodPartiallyEnrolled(currentPod)
-		shouldBeEnabled := util.PodRedirectionEnabled(ns, currentPod)
+		matchesSelector := s.enablementSelector.Matches(currentPod, ns.Labels)
+		namespaceExcluded := s.isNamespaceExcluded(currentPod.Namespace)
+		shouldBeEnabled := matchesSelector && !namespaceExcluded
 		isTerminated := kube.CheckPodTerminal(currentPod)
 		// Check intent (labels) versus status (annotation) - is there a delta we need to fix?
 		changeNeeded := (isEnrolled != shouldBeEnabled) || isPartiallyEnrolled
+
+		if matchesSelector && namespaceExcluded {
+			if isEnrolled || isPartiallyEnrolled {
+				log.Warnf("pod is enrolled in ambient mesh but namespace %s is excluded by excludeNamespaces configuration; pod will be removed from mesh",
+					currentPod.Namespace)
+			} else {
+				log.Debugf("pod (or its ns) is labeled for ambient mesh but namespace %s is excluded by excludeNamespaces configuration; skipping enrollment",
+					currentPod.Namespace)
+			}
+		}
 
 		// nolint: lll
 		log.Debugf("pod update: isEnrolled=%v isPartiallyEnrolled=%v shouldBeEnabled=%v changeNeeded=%v isTerminated=%v, oldPod=%+v, newPod=%+v",
@@ -302,6 +328,21 @@ func (s *InformerHandlers) reconcilePod(input any) error {
 				return err
 			}
 			return nil
+		}
+
+		// Self-heal the host probe ipset for an already-enrolled pod whose probe IP just
+		// (re)appeared. Gate on an actual IP change versus the
+		// previous event so that the many status updates unrelated to networking (pod
+		// conditions, container statuses, etc.) don't each trigger a redundant ipset
+		// syscall. Re-asserting only when the IPs change, still self-heals it.
+		if isEnrolled && shouldBeEnabled && !isTerminated {
+			podIPs := util.GetPodIPsIfPresent(currentPod)
+			if len(podIPs) > 0 && !slices.EqualUnordered(podIPs, util.GetPodIPsIfPresent(oldPod)) {
+				if err := s.dataplane.SyncHostProbeIPSet(currentPod, podIPs); err != nil {
+					log.Warnf("failed to sync host probe ipset for enrolled pod, will retry: %v", err)
+					return err
+				}
+			}
 		}
 
 		if !changeNeeded || isTerminated {
@@ -358,8 +399,10 @@ func (s *InformerHandlers) reconcilePod(input any) error {
 		// we *do not* want to check the cache for the pod - because it (probably)
 		// won't be there anymore. So for this case *alone*, we check the most recent
 		// pod information from the triggering event.
-		if util.PodFullyEnrolled(latestEventPod) || util.PodPartiallyEnrolled(latestEventPod) {
-			log.Debugf("pod is deleted and was (fully or partially) captured, removing from ztunnel")
+		if util.PodFullyEnrolled(latestEventPod) ||
+			util.PodPartiallyEnrolled(latestEventPod) ||
+			s.enablementSelector.Matches(latestEventPod, ns.Labels) {
+			log.Debugf("pod is deleted and was or should be captured, removing from ztunnel")
 			if err := s.dataplane.RemovePodFromMesh(s.ctx, latestEventPod, true); err != nil {
 				log.Warnf("Unable to send pod to ztunnel for removal. Will retry. RemovePodFrmMesh returned: %v", err)
 				return err

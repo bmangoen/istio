@@ -16,11 +16,15 @@ package core
 
 import (
 	"math"
+	"strconv"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	matcher "github.com/envoyproxy/go-control-plane/envoy/config/common/matcher/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	proxyprotocol "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/proxy_protocol/v3"
 	http "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	matchertype "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	xdstype "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -41,16 +45,27 @@ import (
 // applyTrafficPolicy applies the trafficPolicy defined within destinationRule,
 // which can be called for both outbound and inbound cluster, but only connection pool will be applied to inbound cluster.
 func (cb *ClusterBuilder) applyTrafficPolicy(service *model.Service, opts buildClusterOpts) {
-	connectionPool, outlierDetection, loadBalancer, tls, proxyProtocol := selectTrafficPolicyComponents(opts.policy)
+	connectionPool, outlierDetection, loadBalancer, tls, proxyProtocol, retryBudget := selectTrafficPolicyComponents(opts.policy)
 	// Connection pool settings are applicable for both inbound and outbound clusters.
 	if connectionPool == nil {
 		connectionPool = &networking.ConnectionPoolSettings{}
 	}
-	cb.applyConnectionPool(opts.mesh, opts.mutable, connectionPool)
+	// Apply h2 upgrade s.t. h2 connection pool settings can be applied to the cluster.
 	if opts.direction != model.TrafficDirectionInbound {
 		cb.applyH2Upgrade(opts.mutable, opts.port, opts.mesh, connectionPool)
+	}
+	cb.applyConnectionPool(opts.mesh, opts.mutable, connectionPool, retryBudget)
+	if opts.direction != model.TrafficDirectionInbound {
 		applyOutlierDetection(service, opts.mutable.cluster, outlierDetection)
-		applyLoadBalancer(service, opts.mutable.cluster, loadBalancer, opts.port, cb.locality, cb.proxyLabels, opts.mesh)
+		if outlierDetection != nil && len(outlierDetection.OutlierDetectionHttpErrorCodes) > 0 {
+			applyOutlierDetectionErrorCodes(opts.mutable, outlierDetection.OutlierDetectionHttpErrorCodes)
+		}
+		enableSelfDiscovery := cb.proxyMetadata != nil && bool(cb.proxyMetadata.EnableSelfDiscovery)
+		applyLoadBalancer(
+			service, opts.mutable.cluster, loadBalancer, opts.port, cb.locality,
+			cb.proxyLabels, opts.mesh, opts.mutable.dnsWrappedLocalityLbEndpoints,
+			cb.proxyType, cb.proxyID, enableSelfDiscovery,
+		)
 		if opts.clusterMode != SniDnatClusterMode {
 			autoMTLSEnabled := opts.mesh.GetEnableAutoMtls().Value
 			tls, mtlsCtxType := cb.buildUpstreamTLSSettings(tls, opts.serviceAccounts, opts.istioMtlsSni,
@@ -65,6 +80,39 @@ func (cb *ClusterBuilder) applyTrafficPolicy(service *model.Service, opts buildC
 	}
 }
 
+// applyDefaultTrafficPolicy overlays the resolved DestinationRule policy on top of the
+// mesh-wide MeshConfig.DefaultTrafficPolicy baseline, per block. A DR that sets a
+// connectionPool / outlierDetection block overrides that whole block; an unset block
+// inherits the mesh baseline. Returns policy unchanged when no mesh baseline is set.
+func applyDefaultTrafficPolicy(meshDefault *meshconfig.MeshConfig_DefaultTrafficPolicy,
+	policy *networking.TrafficPolicy,
+) *networking.TrafficPolicy {
+	defaultConnPool := meshDefault.GetConnectionPool()
+	defaultOutlier := meshDefault.GetOutlierDetection()
+	if defaultConnPool == nil && defaultOutlier == nil {
+		return policy
+	}
+	needConnPool := defaultConnPool != nil && policy.GetConnectionPool() == nil
+	needOutlier := defaultOutlier != nil && policy.GetOutlierDetection() == nil
+	if !needConnPool && !needOutlier {
+		return policy
+	}
+	// Copy so we never mutate the cached DestinationRule policy. portLevelSettings are
+	// already resolved for this port by the caller, so dropping them here is safe.
+	if policy == nil {
+		policy = &networking.TrafficPolicy{}
+	} else {
+		policy = model.ShallowCopyTrafficPolicy(policy)
+	}
+	if needConnPool {
+		policy.ConnectionPool = defaultConnPool
+	}
+	if needOutlier {
+		policy.OutlierDetection = defaultOutlier
+	}
+	return policy
+}
+
 // selectTrafficPolicyComponents returns the components of TrafficPolicy that should be used for given port.
 func selectTrafficPolicyComponents(policy *networking.TrafficPolicy) (
 	*networking.ConnectionPoolSettings,
@@ -72,40 +120,44 @@ func selectTrafficPolicyComponents(policy *networking.TrafficPolicy) (
 	*networking.LoadBalancerSettings,
 	*networking.ClientTLSSettings,
 	*networking.TrafficPolicy_ProxyProtocol,
+	*networking.TrafficPolicy_RetryBudget,
 ) {
 	if policy == nil {
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 	connectionPool := policy.ConnectionPool
 	outlierDetection := policy.OutlierDetection
 	loadBalancer := policy.LoadBalancer
 	tls := policy.Tls
 	proxyProtocol := policy.ProxyProtocol
+	retryBudget := policy.RetryBudget
 
-	return connectionPool, outlierDetection, loadBalancer, tls, proxyProtocol
+	return connectionPool, outlierDetection, loadBalancer, tls, proxyProtocol, retryBudget
 }
 
 // FIXME: there isn't a way to distinguish between unset values and zero values
 func (cb *ClusterBuilder) applyConnectionPool(mesh *meshconfig.MeshConfig,
 	mc *clusterWrapper, settings *networking.ConnectionPoolSettings,
+	retryBudget *networking.TrafficPolicy_RetryBudget,
 ) {
 	if settings == nil {
 		return
 	}
 
 	threshold := getDefaultCircuitBreakerThresholds()
+	applyRetryBudget(threshold, retryBudget)
+
 	var idleTimeout *durationpb.Duration
 	var maxRequestsPerConnection uint32
 	var maxConcurrentStreams uint32
 	var maxConnectionDuration *durationpb.Duration
+	var connectionKeepalive *networking.ConnectionPoolSettings_HTTPSettings_ConnectionKeepalive
 
 	if settings.Http != nil {
 		if settings.Http.Http2MaxRequests > 0 {
-			// Envoy only applies MaxRequests in HTTP/2 clusters
 			threshold.MaxRequests = &wrapperspb.UInt32Value{Value: uint32(settings.Http.Http2MaxRequests)}
 		}
 		if settings.Http.Http1MaxPendingRequests > 0 {
-			// Envoy only applies MaxPendingRequests in HTTP/1.1 clusters
 			threshold.MaxPendingRequests = &wrapperspb.UInt32Value{Value: uint32(settings.Http.Http1MaxPendingRequests)}
 		}
 
@@ -117,6 +169,7 @@ func (cb *ClusterBuilder) applyConnectionPool(mesh *meshconfig.MeshConfig,
 		idleTimeout = settings.Http.IdleTimeout
 		maxRequestsPerConnection = uint32(settings.Http.MaxRequestsPerConnection)
 		maxConcurrentStreams = uint32(settings.Http.MaxConcurrentStreams)
+		connectionKeepalive = settings.Http.GetHttp2KeepAlive()
 	}
 
 	cb.applyDefaultConnectionPool(mc.cluster)
@@ -141,7 +194,7 @@ func (cb *ClusterBuilder) applyConnectionPool(mesh *meshconfig.MeshConfig,
 		Thresholds: []*cluster.CircuitBreakers_Thresholds{threshold},
 	}
 
-	if maxConnectionDuration != nil || idleTimeout != nil || maxRequestsPerConnection > 0 || maxConcurrentStreams > 0 {
+	if maxConnectionDuration != nil || idleTimeout != nil || maxRequestsPerConnection > 0 || maxConcurrentStreams > 0 || connectionKeepalive != nil {
 		if mc.httpProtocolOptions == nil {
 			mc.httpProtocolOptions = &http.HttpProtocolOptions{}
 		}
@@ -164,12 +217,42 @@ func (cb *ClusterBuilder) applyConnectionPool(mesh *meshconfig.MeshConfig,
 		if http2ProtocolOptions != nil && maxConcurrentStreams > 0 {
 			http2ProtocolOptions.MaxConcurrentStreams = &wrapperspb.UInt32Value{Value: maxConcurrentStreams}
 		}
+		if http2ProtocolOptions != nil && connectionKeepalive != nil {
+			http2ProtocolOptions.ConnectionKeepalive = &core.KeepaliveSettings{
+				Interval: connectionKeepalive.Interval,
+				Timeout:  connectionKeepalive.Timeout,
+			}
+		}
 	}
 	if settings.Http != nil && settings.Http.UseClientProtocol {
 		// Use downstream protocol. If the incoming traffic use HTTP 1.1, the
 		// upstream cluster will use HTTP 1.1, if incoming traffic use HTTP2,
 		// the upstream cluster will use HTTP2.
 		cb.setUseDownstreamProtocol(mc)
+	}
+}
+
+func applyRetryBudget(
+	thresholds *cluster.CircuitBreakers_Thresholds,
+	retryBudget *networking.TrafficPolicy_RetryBudget,
+) {
+	if retryBudget == nil {
+		return
+	}
+
+	percent := &xdstype.Percent{Value: 20.0} // default to 20%
+	if retryBudget.Percent != nil {
+		percent = &xdstype.Percent{Value: retryBudget.Percent.Value}
+	}
+	retryConcurrency := &wrapperspb.UInt32Value{Value: 3} // default to	3
+	if retryBudget.MinRetryConcurrency > 0 {
+		retryConcurrency = &wrapperspb.UInt32Value{Value: retryBudget.MinRetryConcurrency}
+	}
+
+	thresholds.RetryBudget = &cluster.CircuitBreakers_Thresholds_RetryBudget{
+		BudgetPercent:       percent,
+		BudgetInterval:      retryBudget.BudgetInterval,
+		MinRetryConcurrency: retryConcurrency,
 	}
 }
 
@@ -199,7 +282,7 @@ func shouldH2Upgrade(clusterName string, port *model.Port, mesh *meshconfig.Mesh
 			return false
 		}
 		// If user wants an upgrade at destination rule/port level that means he is sure that
-		// it is a Http port - upgrade in such case. This is useful incase protocol sniffing is
+		// it is a Http port - upgrade in such case. This is useful in case protocol sniffing is
 		// enabled and user wants to upgrade/preserve http protocol from client.
 		if override == networking.ConnectionPoolSettings_HTTPSettings_UPGRADE {
 			log.Debugf("Upgrading cluster: %v (%v %v)", clusterName, mesh.H2UpgradePolicy, override)
@@ -235,15 +318,34 @@ func applyLoadBalancer(
 	locality *core.Locality,
 	proxyLabels map[string]string,
 	meshConfig *meshconfig.MeshConfig,
+	wrappedLocalityLbEndpoints *loadbalancer.WrappedLocalityLbEndpoints,
+	proxyType model.NodeType,
+	proxyID string,
+	enableSelfDiscovery bool,
 ) {
-	// Disable panic threshold when SendUnhealthyEndpoints is enabled as enabling it "may" send traffic to unready
+	// DFP clusters (DYNAMIC_DNS ServiceEntries) use CLUSTER_PROVIDED LB policy
+	if c.LbPolicy == cluster.Cluster_CLUSTER_PROVIDED {
+		return
+	}
+	// If HealthyPanicThreshold is unset, disable it when service supports unhealthy endpoints as enabling it "may" send traffic to unready
 	// end points when load balancer is in panic mode.
-	if svc.SupportsUnhealthyEndpoints() {
+	if c.CommonLbConfig.HealthyPanicThreshold == nil && svc.SupportsUnhealthyEndpoints() {
 		c.CommonLbConfig.HealthyPanicThreshold = &xdstype.Percent{Value: 0}
 	}
-	// Use locality lb settings from load balancer settings if present, else use mesh wide locality lb settings
-	localityLbSetting, forceFailover := loadbalancer.GetLocalityLbSetting(meshConfig.GetLocalityLbSetting(), lb.GetLocalityLbSetting(), svc)
-	applyLocalityLoadBalancer(locality, proxyLabels, c, localityLbSetting, forceFailover)
+	lbSettings := loadbalancer.GetEffectiveLbSetting(
+		meshConfig.GetLocalityLbSetting(),
+		meshConfig.GetZoneAwareLbSetting(),
+		lb,
+		svc,
+	)
+	if lbSettings == nil {
+		// No effective locality/zone-aware setting; fall back to the default locality LB cluster config.
+		lbSettings = loadbalancer.LocalityLBSettings{}
+	}
+	lbSettings.ApplyToCluster(
+		c, wrappedLocalityLbEndpoints, locality, proxyLabels,
+		proxyType == model.Waypoint, proxyID, enableSelfDiscovery,
+	)
 
 	if c.GetType() == cluster.Cluster_ORIGINAL_DST {
 		c.LbPolicy = cluster.Cluster_CLUSTER_PROVIDED
@@ -275,30 +377,6 @@ func applyLoadBalancer(
 	}
 
 	ApplyRingHashLoadBalancer(c, lb)
-}
-
-func applyLocalityLoadBalancer(
-	locality *core.Locality,
-	proxyLabels map[string]string,
-	c *cluster.Cluster,
-	localityLB *networking.LocalityLoadBalancerSetting,
-	failover bool,
-) {
-	// Failover should only be applied with outlier detection, or traffic will never failover.
-	enableFailover := failover || c.OutlierDetection != nil
-	// set locality weighted lb config when locality lb is enabled, otherwise it will influence the result of LBPolicy like `least request`
-	if features.EnableLocalityWeightedLbConfig ||
-		(enableFailover && (localityLB.GetFailover() != nil || localityLB.GetFailoverPriority() != nil)) ||
-		localityLB.GetDistribute() != nil {
-		c.CommonLbConfig.LocalityConfigSpecifier = &cluster.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
-			LocalityWeightedLbConfig: &cluster.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
-		}
-	}
-
-	if c.LoadAssignment != nil {
-		// TODO: enable failoverPriority for `STRICT_DNS` cluster type
-		loadbalancer.ApplyLocalityLoadBalancer(c.LoadAssignment, nil, locality, proxyLabels, localityLB, enableFailover)
-	}
 }
 
 // applySimpleDefaultLoadBalancer will set the DefaultLBPolicy and create an LbConfig if used in LoadBalancerSettings
@@ -361,6 +439,7 @@ func applyLeastRequestLoadBalancer(c *cluster.Cluster, loadbalancer *networking.
 }
 
 // setSlowStartConfig will set the warmupDurationSecs for LEAST_REQUEST and ROUND_ROBIN if provided in DestinationRule
+//
 // Deprecated: use setWarmup instead
 func setSlowStartConfig(dur *durationpb.Duration) *cluster.Cluster_SlowStartConfig {
 	return &cluster.Cluster_SlowStartConfig{
@@ -406,7 +485,7 @@ func getDefaultCircuitBreakerThresholds() *cluster.CircuitBreakers_Thresholds {
 		MaxRequests:        &wrapperspb.UInt32Value{Value: math.MaxUint32},
 		MaxConnections:     &wrapperspb.UInt32Value{Value: math.MaxUint32},
 		MaxPendingRequests: &wrapperspb.UInt32Value{Value: math.MaxUint32},
-		TrackRemaining:     true,
+		TrackRemaining:     !features.DisableTrackRemainingMetrics,
 	}
 }
 
@@ -470,13 +549,55 @@ func applyOutlierDetection(service *model.Service, c *cluster.Cluster, outlier *
 	// FIXME: we can't distinguish between it being unset or being explicitly set to 0
 	minHealthPercent := outlier.MinHealthPercent
 	if minHealthPercent >= 0 {
-		// When we are sending unhealthy endpoints, we should disable Panic Threshold. Otherwise
+		// This service requires that we send unhealthy endpoints, we should disable Panic Threshold. Otherwise
 		// Envoy will send traffic to "Unready" pods when the percentage of healthy hosts fall
 		// below minimum health percentage.
-		if service.SupportsUnhealthyEndpoints() {
+		if service.ForcesSupportUnhealthyEndpoints() {
 			minHealthPercent = 0
 		}
 		c.CommonLbConfig.HealthyPanicThreshold = &xdstype.Percent{Value: float64(minHealthPercent)}
+	}
+}
+
+// applyOutlierDetectionErrorCodes sets the HttpProtocolOptions.OutlierDetection.ErrorMatcher
+// on the cluster based on the outlier_detection_http_error_codes field in DestinationRule.
+// When set, Envoy treats only the specified HTTP status codes as outlier detection failures,
+// replacing the default 5xx-only behavior.
+func applyOutlierDetectionErrorCodes(mc *clusterWrapper, codes []uint32) {
+	if mc.httpProtocolOptions == nil {
+		mc.httpProtocolOptions = &http.HttpProtocolOptions{}
+	}
+	rules := make([]*matcher.MatchPredicate, 0, len(codes))
+	for _, code := range codes {
+		rules = append(rules, &matcher.MatchPredicate{
+			Rule: &matcher.MatchPredicate_HttpResponseHeadersMatch{
+				HttpResponseHeadersMatch: &matcher.HttpHeadersMatch{
+					Headers: []*route.HeaderMatcher{{
+						Name: ":status",
+						HeaderMatchSpecifier: &route.HeaderMatcher_StringMatch{
+							StringMatch: &matchertype.StringMatcher{
+								MatchPattern: &matchertype.StringMatcher_Exact{
+									Exact: strconv.Itoa(int(code)),
+								},
+							},
+						},
+					}},
+				},
+			},
+		})
+	}
+	var predicate *matcher.MatchPredicate
+	if len(rules) == 1 {
+		predicate = rules[0]
+	} else {
+		predicate = &matcher.MatchPredicate{
+			Rule: &matcher.MatchPredicate_OrMatch{
+				OrMatch: &matcher.MatchPredicate_MatchSet{Rules: rules},
+			},
+		}
+	}
+	mc.httpProtocolOptions.OutlierDetection = &http.HttpProtocolOptions_OutlierDetection{
+		ErrorMatcher: predicate,
 	}
 }
 
@@ -534,6 +655,8 @@ func (cb *ClusterBuilder) applyUpstreamProxyProtocol(
 		return
 	}
 	c := opts.mutable
+
+	cb.maybeDisableBaggageDiscovery(c.cluster)
 
 	// No existing transport; wrap RawBuffer.
 	if c.cluster.TransportSocket == nil && len(c.cluster.TransportSocketMatches) == 0 {

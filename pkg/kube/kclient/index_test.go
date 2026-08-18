@@ -47,7 +47,7 @@ func TestIndex(t *testing.T) {
 	c := kube.NewFakeClient()
 	pods := kclient.New[*corev1.Pod](c)
 	c.RunAndWait(test.NewStop(t))
-	index := kclient.CreateIndex[SaNode, *corev1.Pod](pods, func(pod *corev1.Pod) []SaNode {
+	index := kclient.CreateIndex[SaNode, *corev1.Pod](pods, "saNode", func(pod *corev1.Pod) []SaNode {
 		if len(pod.Spec.NodeName) == 0 {
 			return nil
 		}
@@ -78,7 +78,7 @@ func TestIndex(t *testing.T) {
 	}
 	assert.Equal(t, index.Lookup(k1), nil)
 	assert.Equal(t, index.Lookup(k2), nil)
-	pod1 := &corev1.Pod{
+	pod1 := kube.EnsureTypeMeta(&corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pod",
 			Namespace: "ns",
@@ -87,8 +87,8 @@ func TestIndex(t *testing.T) {
 			ServiceAccountName: "sa",
 			NodeName:           "node",
 		},
-	}
-	pod2 := &corev1.Pod{
+	})
+	pod2 := kube.EnsureTypeMeta(&corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pod2",
 			Namespace: "ns",
@@ -97,8 +97,8 @@ func TestIndex(t *testing.T) {
 			ServiceAccountName: "sa2",
 			NodeName:           "node",
 		},
-	}
-	pod3 := &corev1.Pod{
+	})
+	pod3 := kube.EnsureTypeMeta(&corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pod3",
 			Namespace: "ns",
@@ -107,7 +107,7 @@ func TestIndex(t *testing.T) {
 			ServiceAccountName: "sa",
 			NodeName:           "node",
 		},
-	}
+	})
 
 	assertIndex := func(k SaNode, pods ...*corev1.Pod) {
 		t.Helper()
@@ -168,7 +168,7 @@ func TestIndexFilters(t *testing.T) {
 	})
 	pc := clienttest.NewWriter[*corev1.Pod](t, c)
 	c.RunAndWait(test.NewStop(t))
-	index := kclient.CreateStringIndex[*corev1.Pod](pods, func(pod *corev1.Pod) []string {
+	index := kclient.CreateStringIndex[*corev1.Pod](pods, "podIp", func(pod *corev1.Pod) []string {
 		if pod.Status.PodIP == "" {
 			return nil
 		}

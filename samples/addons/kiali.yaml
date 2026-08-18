@@ -6,12 +6,13 @@ metadata:
   name: kiali
   namespace: "istio-system"
   labels:
-    helm.sh/chart: kiali-server-2.6.0
+    
+    helm.sh/chart: kiali-server-2.27.0
     app: kiali
     app.kubernetes.io/name: kiali
     app.kubernetes.io/instance: kiali
-    version: "v2.6.0"
-    app.kubernetes.io/version: "v2.6.0"
+    version: "v2.27.0"
+    app.kubernetes.io/version: "v2.27.0"
     app.kubernetes.io/part-of: "kiali"
 ...
 ---
@@ -22,12 +23,13 @@ metadata:
   name: kiali
   namespace: "istio-system"
   labels:
-    helm.sh/chart: kiali-server-2.6.0
+    
+    helm.sh/chart: kiali-server-2.27.0
     app: kiali
     app.kubernetes.io/name: kiali
     app.kubernetes.io/instance: kiali
-    version: "v2.6.0"
-    app.kubernetes.io/version: "v2.6.0"
+    version: "v2.27.0"
+    app.kubernetes.io/version: "v2.27.0"
     app.kubernetes.io/part-of: "kiali"
 data:
   config.yaml: |
@@ -40,12 +42,23 @@ data:
       openshift:
         client_id_prefix: kiali
       strategy: anonymous
+    chat_ai:
+      default_provider: ""
+      enabled: false
+      providers: []
+      store_config:
+        enabled: true
+        max_cache_memory_mb: 1024
+        reduce_threshold: 15
+        reduce_with_ai: false
     clustering:
       autodetect_secrets:
         enabled: true
         label: kiali.io/multiCluster=true
       clusters: []
     deployment:
+      additional_pod_containers_yaml: []
+      additional_pod_init_containers_yaml: []
       additional_service_yaml: {}
       affinity:
         node: {}
@@ -55,9 +68,11 @@ data:
       configmap_annotations: {}
       custom_envs: []
       custom_secrets: []
+      discovery_selectors: {}
       dns:
         config: {}
         policy: ""
+      extra_labels: {}
       host_aliases: []
       hpa:
         api_version: autoscaling/v2
@@ -66,7 +81,7 @@ data:
       image_name: quay.io/kiali/kiali
       image_pull_policy: IfNotPresent
       image_pull_secrets: []
-      image_version: v2.6
+      image_version: v2.27
       ingress:
         additional_labels: {}
         class_name: nginx
@@ -80,8 +95,14 @@ data:
         sampler_rate: "1"
         time_field_format: 2006-01-02T15:04:05Z07:00
       namespace: istio-system
+      network_policy:
+        enabled: false
       node_selector: {}
-      pod_annotations: {}
+      pod_annotations:
+        proxy.istio.io/config: '{ "holdApplicationUntilProxyStarts": true }'
+      pod_disruption_budget:
+        api_version: policy/v1
+        spec: {}
       pod_labels:
         sidecar.istio.io/inject: "false"
       priority_class_name: ""
@@ -108,22 +129,30 @@ data:
       security_context: {}
       service_annotations: {}
       service_type: ""
+      strategy: {}
+      tls_config:
+        cipher_suites: []
+        max_version: ""
+        min_version: ""
+        source: config
       tolerations: []
       topology_spread_constraints: []
-      version_label: v2.6.0
+      version_label: v2.27.0
       view_only_mode: false
     external_services:
       custom_dashboards:
         enabled: true
       istio:
         root_namespace: istio-system
+      prometheus:
+        enabled: true
       tracing:
         enabled: false
     identity:
       cert_file: ""
       private_key_file: ""
-    istio_namespace: istio-system
     kiali_feature_flags:
+      custom_workload_types: []
       disabled_features: []
       validations:
         ignore:
@@ -134,9 +163,13 @@ data:
       observability:
         metrics:
           enabled: true
+          health_status:
+            enabled: false
+            max_consecutive_na: 3
           port: 9090
       port: 20001
       web_root: /kiali
+    skipResources: []
 ...
 ---
 # Source: kiali-server/templates/role.yaml
@@ -145,12 +178,13 @@ kind: ClusterRole
 metadata:
   name: kiali
   labels:
-    helm.sh/chart: kiali-server-2.6.0
+    
+    helm.sh/chart: kiali-server-2.27.0
     app: kiali
     app.kubernetes.io/name: kiali
     app.kubernetes.io/instance: kiali
-    version: "v2.6.0"
-    app.kubernetes.io/version: "v2.6.0"
+    version: "v2.27.0"
+    app.kubernetes.io/version: "v2.27.0"
     app.kubernetes.io/part-of: "kiali"
 rules:
 - apiGroups: [""]
@@ -205,6 +239,7 @@ rules:
   - extensions.istio.io
   - telemetry.istio.io
   - gateway.networking.k8s.io
+  - inference.networking.k8s.io
   resources: ["*"]
   verbs:
   - get
@@ -221,11 +256,6 @@ rules:
   - list
   - watch
   - patch
-- apiGroups: ["project.openshift.io"]
-  resources:
-  - projects
-  verbs:
-  - get
 - apiGroups: ["route.openshift.io"]
   resources:
   - routes
@@ -258,12 +288,13 @@ kind: ClusterRoleBinding
 metadata:
   name: kiali
   labels:
-    helm.sh/chart: kiali-server-2.6.0
+    
+    helm.sh/chart: kiali-server-2.27.0
     app: kiali
     app.kubernetes.io/name: kiali
     app.kubernetes.io/instance: kiali
-    version: "v2.6.0"
-    app.kubernetes.io/version: "v2.6.0"
+    version: "v2.27.0"
+    app.kubernetes.io/version: "v2.27.0"
     app.kubernetes.io/part-of: "kiali"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -282,12 +313,13 @@ metadata:
   name: kiali
   namespace: "istio-system"
   labels:
-    helm.sh/chart: kiali-server-2.6.0
+    
+    helm.sh/chart: kiali-server-2.27.0
     app: kiali
     app.kubernetes.io/name: kiali
     app.kubernetes.io/instance: kiali
-    version: "v2.6.0"
-    app.kubernetes.io/version: "v2.6.0"
+    version: "v2.27.0"
+    app.kubernetes.io/version: "v2.27.0"
     app.kubernetes.io/part-of: "kiali"
   annotations:
 spec:
@@ -312,12 +344,13 @@ metadata:
   name: kiali
   namespace: "istio-system"
   labels:
-    helm.sh/chart: kiali-server-2.6.0
+    
+    helm.sh/chart: kiali-server-2.27.0
     app: kiali
     app.kubernetes.io/name: kiali
     app.kubernetes.io/instance: kiali
-    version: "v2.6.0"
-    app.kubernetes.io/version: "v2.6.0"
+    version: "v2.27.0"
+    app.kubernetes.io/version: "v2.27.0"
     app.kubernetes.io/part-of: "kiali"
 spec:
   replicas: 1
@@ -334,24 +367,27 @@ spec:
     metadata:
       name: kiali
       labels:
-        helm.sh/chart: kiali-server-2.6.0
+        
+        helm.sh/chart: kiali-server-2.27.0
         app: kiali
         app.kubernetes.io/name: kiali
         app.kubernetes.io/instance: kiali
-        version: "v2.6.0"
-        app.kubernetes.io/version: "v2.6.0"
+        version: "v2.27.0"
+        app.kubernetes.io/version: "v2.27.0"
         app.kubernetes.io/part-of: "kiali"
         sidecar.istio.io/inject: "false"
       annotations:
-        checksum/config: fa962dfbcf93d8e07874a00cc2b1a90c198c9cd380fc110911e20f05fc0cda8a
+        checksum/config: bcf35f4254febbc0f794011c1a10a0a559618926bf90e8cb6c37c7dd86b7b806
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
+        prometheus.io/scheme: "http"
         kiali.io/dashboards: go,kiali
+        proxy.istio.io/config: '{ "holdApplicationUntilProxyStarts": true }'
     spec:
       serviceAccountName: kiali
       containers:
-      - image: "quay.io/kiali/kiali:v2.6"
-        imagePullPolicy: IfNotPresent
+      - image: "quay.io/kiali/kiali:v2.27"
+        imagePullPolicy: "IfNotPresent"
         name: kiali
         command:
         - "/opt/kiali/kiali"
@@ -363,6 +399,8 @@ spec:
           privileged: false
           readOnlyRootFilesystem: true
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
@@ -415,6 +453,9 @@ spec:
           mountPath: "/kiali-secret"
         - name: kiali-cabundle
           mountPath: "/kiali-cabundle"
+        - name: "kiali-multi-cluster-secret"
+          mountPath: "/kiali-remote-cluster-secrets/kiali-multi-cluster-secret"
+          readOnly: true
         resources:
           limits:
             memory: 1Gi
@@ -431,10 +472,14 @@ spec:
           optional: true
       - name: kiali-secret
         secret:
-          secretName: kiali
+          secretName: "kiali"
           optional: true
       - name: kiali-cabundle
         configMap:
           name: kiali-cabundle
+          optional: true
+      - name: "kiali-multi-cluster-secret"
+        secret:
+          secretName: "kiali-multi-cluster-secret"
           optional: true
 ...

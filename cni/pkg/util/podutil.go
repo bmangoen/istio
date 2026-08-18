@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -27,7 +28,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"istio.io/api/annotation"
-	"istio.io/api/label"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/log"
 )
@@ -49,35 +49,24 @@ var annotationRemovePatch = []byte(fmt.Sprintf(
 	annotation.AmbientRedirection.Name,
 ))
 
-// PodRedirectionEnabled determines if a pod should or should not be configured
-// to have traffic redirected thru the node proxy.
-func PodRedirectionEnabled(namespace *corev1.Namespace, pod *corev1.Pod) bool {
-	if !(namespace.GetLabels()[label.IoIstioDataplaneMode.Name] == constants.DataplaneModeAmbient ||
-		pod.GetLabels()[label.IoIstioDataplaneMode.Name] == constants.DataplaneModeAmbient) {
-		// Neither namespace nor pod has ambient mode enabled
-		return false
+// SplitExcludeNamespaces splits a comma-separated namespace string into a slice,
+// filtering out empty strings that result from splitting an empty input or consecutive/trailing commas.
+func SplitExcludeNamespaces(s string) []string {
+	var result []string
+	for ns := range strings.SplitSeq(s, ",") {
+		ns = strings.TrimSpace(ns)
+		if ns != "" {
+			result = append(result, ns)
+		}
 	}
-	if podHasSidecar(pod) {
-		// Ztunnel and sidecar for a single pod is currently not supported; opt out.
-		return false
-	}
-	if pod.GetLabels()[label.IoIstioDataplaneMode.Name] == constants.DataplaneModeNone {
-		// Pod explicitly asked to not have ambient redirection enabled
-		return false
-	}
-	if pod.Spec.HostNetwork {
-		// Host network pods cannot be captured, as we require inserting rules into the pod network namespace.
-		// If we were to allow them, we would be writing these rules into the host network namespace, effectively breaking the host.
-		return false
-	}
-	return true
+	return result
 }
 
 // PodFullyEnrolled reports on whether the pod _has_ actually been fully configured for traffic redirection.
 //
 // That is, have we annotated it after successfully setting up iptables rules AND sending it to a node proxy instance.
 //
-// If you just want to know if the pod _should be_ configured for traffic redirection, see PodRedirectionEnabled
+// If you just want to know if the pod _should be_ configured for traffic redirection, see CompiledEnablementSelectors.Matches
 func PodFullyEnrolled(pod *corev1.Pod) bool {
 	if pod != nil {
 		return pod.GetAnnotations()[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionEnabled
@@ -93,7 +82,7 @@ func PodFullyEnrolled(pod *corev1.Pod) bool {
 //
 // Pods like this still need to undergo the removal process (to potentially undo the redirection).
 //
-// If you just want to know if the pod _should be_ configured for traffic redirection, see PodRedirectionEnabled
+// If you just want to know if the pod _should be_ configured for traffic redirection, see CompiledEnablementSelectors.Matches
 func PodPartiallyEnrolled(pod *corev1.Pod) bool {
 	if pod != nil {
 		return pod.GetAnnotations()[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionPending
@@ -101,8 +90,8 @@ func PodPartiallyEnrolled(pod *corev1.Pod) bool {
 	return false
 }
 
-func podHasSidecar(pod *corev1.Pod) bool {
-	if _, f := pod.GetAnnotations()[annotation.SidecarStatus.Name]; f {
+func podHasSidecar(podAnnotations map[string]string) bool {
+	if _, f := podAnnotations[annotation.SidecarStatus.Name]; f {
 		return true
 	}
 	return false

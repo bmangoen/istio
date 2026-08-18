@@ -14,6 +14,12 @@
 
 package configdump
 
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
 type Locality struct {
 	Region  string `json:"region,omitempty"`
 	Zone    string `json:"zone,omitempty"`
@@ -67,17 +73,50 @@ type ZtunnelEndpoint struct {
 	Port        map[uint16]uint16 `json:"port"`
 }
 
+type CIDRVIP struct {
+	CIDR    string `json:"cidr"`
+	Network string `json:"network,omitempty"`
+}
+
+func (c *CIDRVIP) UnmarshalJSON(data []byte) error {
+	type alias CIDRVIP
+	var raw alias
+	if err := json.Unmarshal(data, &raw); err == nil {
+		*c = CIDRVIP(raw)
+		return nil
+	}
+
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	network, cidr, found := strings.Cut(s, "/")
+	if !found {
+		return fmt.Errorf("invalid cidrVip %q", s)
+	}
+	c.Network = network
+	c.CIDR = cidr
+	return nil
+}
+
+func (c CIDRVIP) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.Network + "/" + c.CIDR)
+}
+
 type ZtunnelService struct {
 	Name            string                      `json:"name"`
 	Namespace       string                      `json:"namespace"`
 	Hostname        string                      `json:"hostname"`
 	Addresses       []string                    `json:"vips"`
+	CIDRVIPs        []CIDRVIP                   `json:"cidrVips,omitempty"`
 	Ports           map[string]int              `json:"ports"`
 	LoadBalancer    *LoadBalancer               `json:"loadBalancer,omitempty"`
 	Waypoint        *GatewayAddress             `json:"waypoint,omitempty"`
 	Endpoints       map[string]*ZtunnelEndpoint `json:"endpoints"`
 	SubjectAltNames []string                    `json:"subjectAltNames,omitempty"`
 	IPFamilies      string                      `json:"ipFamilies"`
+	Canonical       bool                        `json:"canonical,omitempty"`
+	Visibility      string                      `json:"visibility,omitempty"`
 }
 
 type PolicyMatch struct {
@@ -127,6 +166,7 @@ type CertsDump struct {
 	Identity  string  `json:"identity"`
 	State     string  `json:"state"`
 	CertChain []*Cert `json:"certChain"`
+	RootCert  []*Cert `json:"rootCerts"`
 }
 
 type Cert struct {

@@ -51,6 +51,10 @@ type delayedHandlerRegistration struct {
 	hasSynced *atomic.Pointer[func() bool]
 }
 
+func (r delayedHandlerRegistration) HasSyncedChecker() cache.DoneChecker {
+	panic("not implemented; use HasSynced")
+}
+
 func (r delayedHandlerRegistration) HasSynced() bool {
 	if s := r.hasSynced.Load(); s != nil {
 		return (*s)()
@@ -59,6 +63,7 @@ func (r delayedHandlerRegistration) HasSynced() bool {
 }
 
 type delayedIndex[T any] struct {
+	name    string
 	indexer *atomic.Pointer[RawIndexer]
 	extract func(o T) []string
 }
@@ -71,13 +76,13 @@ func (d delayedIndex[T]) Lookup(key string) []interface{} {
 	return nil
 }
 
-func (s *delayedClient[T]) Index(extract func(o T) []string) RawIndexer {
+func (s *delayedClient[T]) Index(name string, extract func(o T) []string) RawIndexer {
 	if c := s.inf.Load(); c != nil {
-		return (*c).Index(extract)
+		return (*c).Index(name, extract)
 	}
 	s.hm.Lock()
 	defer s.hm.Unlock()
-	di := delayedIndex[T]{indexer: new(atomic.Pointer[RawIndexer]), extract: extract}
+	di := delayedIndex[T]{name: name, indexer: new(atomic.Pointer[RawIndexer]), extract: extract}
 	s.indexers = append(s.indexers, di)
 	return di
 }
@@ -183,7 +188,7 @@ func (s *delayedClient[T]) set(inf Informer[T]) {
 		}
 		s.handlers = nil
 		for _, i := range s.indexers {
-			res := inf.Index(i.extract)
+			res := inf.Index(i.name, i.extract)
 			i.indexer.Store(&res)
 		}
 		s.indexers = nil

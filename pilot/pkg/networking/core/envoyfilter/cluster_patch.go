@@ -28,6 +28,7 @@ import (
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/proto/merge"
+	"istio.io/istio/pkg/slices"
 )
 
 // ApplyClusterMerge processes the MERGE operation and merges the supplied configuration to the matched clusters.
@@ -41,11 +42,17 @@ func ApplyClusterMerge(pctx networking.EnvoyFilter_PatchContext, efw *model.Merg
 	// In case the patches cause panic, use the clusters generated before to reduce the influence.
 	out = c
 	if efw == nil {
-		return
+		return out
 	}
 	for _, cp := range efw.Patches[networking.EnvoyFilter_CLUSTER] {
 		applied := false
-		if cp.Operation != networking.EnvoyFilter_Patch_MERGE {
+		// For removed patches, skip the merge if the patch matches.
+		if cp.Operation == networking.EnvoyFilter_Patch_REMOVE &&
+			commonConditionMatch(pctx, cp) &&
+			clusterMatch(c, cp, hosts) {
+			return nil
+		}
+		if !isMergeOperation(cp.Operation) {
 			IncrementEnvoyFilterMetric(cp.Key(), Cluster, applied)
 			continue
 		}
@@ -57,7 +64,7 @@ func ApplyClusterMerge(pctx networking.EnvoyFilter_PatchContext, efw *model.Merg
 			}
 			applied = true
 			if !tsMerged {
-				merge.Merge(c, cp.Value)
+				mergePatchValue(cp.Operation, c, cp.Value)
 			}
 		}
 		IncrementEnvoyFilterMetric(cp.Key(), Cluster, applied)
@@ -120,22 +127,6 @@ func mergeTransportSocketCluster(c *cluster.Cluster, cp *model.EnvoyFilterConfig
 	return true, nil
 }
 
-// ShouldKeepCluster checks if there is a REMOVE patch on the cluster, returns false if there is one so that it is removed.
-func ShouldKeepCluster(pctx networking.EnvoyFilter_PatchContext, efw *model.MergedEnvoyFilterWrapper, c *cluster.Cluster, hosts []host.Name) bool {
-	if efw == nil {
-		return true
-	}
-	for _, cp := range efw.Patches[networking.EnvoyFilter_CLUSTER] {
-		if cp.Operation != networking.EnvoyFilter_Patch_REMOVE {
-			continue
-		}
-		if commonConditionMatch(pctx, cp) && clusterMatch(c, cp, hosts) {
-			return false
-		}
-	}
-	return true
-}
-
 // InsertedClusters collects all clusters that are added via ADD operation and match the patch context.
 func InsertedClusters(pctx networking.EnvoyFilter_PatchContext, efw *model.MergedEnvoyFilterWrapper) []*cluster.Cluster {
 	if efw == nil {
@@ -180,7 +171,7 @@ func clusterMatch(cluster *cluster.Cluster, cp *model.EnvoyFilterConfigPatchWrap
 		return false
 	}
 
-	if cMatch.Service != "" && !hostContains(hostMatches, host.Name(cMatch.Service)) {
+	if cMatch.Service != "" && !slices.Contains(hostMatches, host.Name(cMatch.Service)) {
 		return false
 	}
 
@@ -190,13 +181,4 @@ func clusterMatch(cluster *cluster.Cluster, cp *model.EnvoyFilterConfigPatchWrap
 		return false
 	}
 	return true
-}
-
-func hostContains(hosts []host.Name, service host.Name) bool {
-	for _, h := range hosts {
-		if h == service {
-			return true
-		}
-	}
-	return false
 }

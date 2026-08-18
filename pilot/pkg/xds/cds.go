@@ -20,6 +20,7 @@ import (
 	"istio.io/istio/pilot/pkg/networking/core"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/jwt"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -39,23 +40,20 @@ var skippedCdsConfigs = sets.New(
 	kind.Secret,
 	kind.Telemetry,
 	kind.WasmPlugin,
+	kind.TrafficExtension,
 	kind.ProxyConfig,
 	kind.DNSName,
-
-	kind.KubernetesGateway,
+	kind.Endpoints,
+	// we can skip Address here to avoid pushing Sidecars and Gateways on Address changes,
+	// it's already checked in waypointNeedsPush
+	kind.Address,
 )
 
-// Map all configs that impact CDS for gateways when `PILOT_FILTER_GATEWAY_CLUSTER_CONFIG = true`.
+// Map all aditional configs that impact CDS for gateways.
+// Gateway resources can impact VirtualService selection and so should need a push.
 var pushCdsGatewayConfig = func() sets.Set[kind.Kind] {
 	s := sets.New(
-		kind.VirtualService,
 		kind.Gateway,
-
-		kind.KubernetesGateway,
-		kind.HTTPRoute,
-		kind.TCPRoute,
-		kind.TLSRoute,
-		kind.GRPCRoute,
 	)
 	if features.JwksFetchMode != jwt.Istiod {
 		s.Insert(kind.RequestAuthentication)
@@ -69,38 +67,40 @@ func cdsNeedsPush(req *model.PushRequest, proxy *model.Proxy) (*model.PushReques
 	if res, ok := xdsNeedsPush(req, proxy); ok {
 		return req, res
 	}
-	if proxy.Type == model.Waypoint && waypointNeedsPush(req) {
+	if proxy.Type == model.Waypoint && waypointNeedsPush(req, proxy) {
 		return req, true
 	}
-	if !req.Full {
-		return req, false
-	}
+
+	// Optimization: Skip CDS for headless endpoint updates.
+	// For routers: Clusters are EDS type - endpoint IPs delivered via EDS.
+	// For sidecars: Clusters are ORIGINAL_DST (no endpoints) or EDS type.
+	// In both cases, cluster definitions are static when only endpoints change.
+	// However, if ServiceUpdate is also present, the service definition changed
+	// (ports, labels, etc.) and we need to push CDS.
+	headlessOnly := req.Reason.Has(model.HeadlessEndpointUpdate) && !req.Reason.Has(model.ServiceUpdate)
 
 	relevantUpdates := make(sets.Set[model.ConfigKey])
 	filtered := false
 	checkGateway := false
 	for config := range req.ConfigsUpdated {
+		// Check if all updates are ServiceEntry (headless endpoint marker)
+		if config.Kind != kind.ServiceEntry {
+			headlessOnly = false
+		}
+
 		if proxy.Type == model.Router {
 			if config.Kind == kind.Gateway {
 				// Do the check outside of the loop since its slow; just trigger we need it
 				checkGateway = true
 			}
-			if features.FilterGatewayClusterConfig {
-				if _, f := pushCdsGatewayConfig[config.Kind]; f {
-					relevantUpdates.Insert(config)
-					continue
-				}
-			}
-			if config.Kind == kind.VirtualService {
-				// We largely don't use VirtualService for CDS building. However, we do use it as part of Sidecar scoping, which
-				// implicitly includes VS destinations.
-				// Since Routers do not use Sidecar, though, we can skip for Router.
-				filtered = true
+
+			if _, f := pushCdsGatewayConfig[config.Kind]; f {
+				relevantUpdates.Insert(config)
 				continue
 			}
 		}
 
-		if _, f := skippedCdsConfigs[config.Kind]; !f {
+		if !skippedCdsConfigs.Contains(config.Kind) {
 			relevantUpdates.Insert(config)
 		} else {
 			// we filtered a config
@@ -108,12 +108,17 @@ func cdsNeedsPush(req *model.PushRequest, proxy *model.Proxy) (*model.PushReques
 		}
 	}
 
+	if headlessOnly {
+		return req, false
+	}
+
 	needsPush := false
 
 	if checkGateway {
 		autoPassthroughModeChanged := proxy.MergedGateway.HasAutoPassthroughGateways() != proxy.PrevMergedGateway.HasAutoPassthroughGateway()
 		autoPassthroughHostsChanged := !proxy.MergedGateway.GetAutoPassthroughGatewaySNIHosts().Equals(proxy.PrevMergedGateway.GetAutoPassthroughSNIHosts())
-		if autoPassthroughModeChanged || autoPassthroughHostsChanged {
+		gatewayNamesChanged := proxy.MergedGateway == nil || !slices.EqualUnordered(proxy.MergedGateway.GetGatewayNames(), proxy.PrevMergedGateway.GetGatewayNames())
+		if autoPassthroughModeChanged || autoPassthroughHostsChanged || gatewayNamesChanged {
 			needsPush = true
 		}
 	}

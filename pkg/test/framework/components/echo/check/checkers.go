@@ -111,6 +111,15 @@ func ErrorContains(expected string) echo.Checker {
 	}
 }
 
+// TLSHandshakeFailure checks that the call failed with a TLS handshake error.
+func TLSHandshakeFailure() echo.Checker {
+	return ErrorContains("tls: handshake failure")
+}
+
+func ConnectionResetByPeer() echo.Checker {
+	return ErrorContains("read: connection reset by peer")
+}
+
 func ErrorOrStatus(expected int) echo.Checker {
 	return Or(Error(), Status(expected))
 }
@@ -262,6 +271,15 @@ func Alpn(expected string) echo.Checker {
 	return Each(func(r echoClient.Response) error {
 		if r.Alpn != expected {
 			return fmt.Errorf("expected alpn %s, received %s", expected, r.Alpn)
+		}
+		return nil
+	})
+}
+
+func SNI(expected string) echo.Checker {
+	return Each(func(r echoClient.Response) error {
+		if r.SNI != expected {
+			return fmt.Errorf("expected SNI %s, received %s", expected, r.SNI)
 		}
 		return nil
 	})

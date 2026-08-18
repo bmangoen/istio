@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors. All Rights Reserved.
 //
@@ -22,11 +21,16 @@
 package otelcollector
 
 import (
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/istio"
@@ -47,8 +51,11 @@ var (
 	//go:embed testdata/otel-tracing-res-detectors.yaml
 	otelTracingResDetectorsCfg string
 
-	//go:embed testdata/test-otel-grpc-with-initial-metadata.yaml
+	//go:embed testdata/otel-grpc-with-initial-metadata.yaml
 	otelTracingGRPCWithInitialMetadataCfg string
+
+	//go:embed testdata/otel-tracing-with-auth.yaml
+	otelTracingWithAuth string
 
 	//go:embed testdata/echo-gateway.yaml
 	echoGateway string
@@ -70,7 +77,7 @@ func TestProxyTracingOpenTelemetryProvider(t *testing.T) {
 	}{
 		{
 			name:            "grpc exporter",
-			customAttribute: "provider=otel",
+			customAttribute: "provider=otel and key1=val1",
 			cfgFile:         otelTracingCfg,
 		},
 		{
@@ -88,6 +95,11 @@ func TestProxyTracingOpenTelemetryProvider(t *testing.T) {
 			customAttribute: "provider=test-otel-grpc-with-initial-metadata",
 			cfgFile:         otelTracingGRPCWithInitialMetadataCfg,
 		},
+		{
+			name:            "grpc exporter with auth",
+			customAttribute: "provider=otel-with-auth",
+			cfgFile:         otelTracingWithAuth,
+		},
 	}
 
 	framework.NewTest(t).
@@ -104,7 +116,9 @@ func TestProxyTracingOpenTelemetryProvider(t *testing.T) {
 						for _, cluster := range ctx.Clusters().ByNetwork()[ctx.Clusters().Default().NetworkName()] {
 							ctx.NewSubTest(cluster.StableName()).Run(func(ctx framework.TestContext) {
 								retry.UntilSuccessOrFail(ctx, func() error {
-									err := tracing.SendTraffic(ctx, nil, cluster)
+									err := tracing.SendTraffic(ctx, map[string][]string{
+										"key1": {"val1"},
+									}, cluster)
 									if err != nil {
 										return fmt.Errorf("cannot send traffic from cluster %s: %v", cluster.Name(), err)
 									}
@@ -178,10 +192,40 @@ func TestGatewayTracing(t *testing.T) {
 func TestMain(m *testing.M) {
 	framework.NewSuite(m).
 		Label(label.CustomSetup).
-		Setup(istio.Setup(tracing.GetIstioInstance(), setupConfig)).
+		Setup(istio.Setup(tracing.GetIstioInstance(), setupConfig, setupOtelCredentials)).
 		Setup(tracing.TestSetup).
 		Setup(testSetup).
 		Run()
+}
+
+// setupOtelCredentials creates a secret in the istio-system namespace
+// which will be mounted into Istiod and used by the OTel tracer provider.
+func setupOtelCredentials(ctx resource.Context) error {
+	systemNs, err := istio.ClaimSystemNamespace(ctx)
+	if err != nil {
+		return err
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "otel-credentials",
+			Namespace: systemNs.Name(),
+		},
+		Data: map[string][]byte{
+			"bearer-token": []byte("Bearer somerandomtoken"),
+		},
+	}
+	for _, cluster := range ctx.AllClusters().Primaries() {
+		if _, err := cluster.Kube().CoreV1().Secrets(systemNs.Name()).Create(context.TODO(), secret, metav1.CreateOptions{}); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				if _, err := cluster.Kube().CoreV1().Secrets(systemNs.Name()).Update(context.TODO(), secret, metav1.UpdateOptions{}); err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // TODO: convert test to Telemetry API for both scenarios
@@ -194,6 +238,13 @@ values:
   pilot:
     env:
       PILOT_SPAWN_UPSTREAM_SPAN_FOR_GATEWAY: true
+    envVarFrom:
+    - name: "OTEL_GRPC_AUTHORIZATION"
+      valueFrom:
+        secretKeyRef:
+          name: otel-credentials
+          key: bearer-token
+          optional: true
 meshConfig:
   enableTracing: true
   extensionProviders:
@@ -227,11 +278,19 @@ meshConfig:
         initialMetadata:
         - name: "Authentication"
           value: "token-xxxxx"
+  - name: test-otel-grpc-auth
+    opentelemetry:
+      service: opentelemetry-collector.istio-system.svc.cluster.local
+      port: 5317
+      grpc:
+        initialMetadata:
+        - name: "Authorization"
+          envName: "OTEL_GRPC_AUTHORIZATION"
 `
 }
 
 func testSetup(ctx resource.Context) (err error) {
 	addrs, _ := tracing.GetIngressInstance().HTTPAddresses()
 	_, err = opentelemetry.New(ctx, opentelemetry.Config{IngressAddr: addrs[0]})
-	return
+	return err
 }

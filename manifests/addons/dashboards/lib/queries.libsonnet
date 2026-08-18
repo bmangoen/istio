@@ -117,6 +117,23 @@ local variables = import './variables.libsonnet';
           sum(rate(labels('istio_dns_requests_total', podLabels)), by=['pod'])
         ),
 
+      socketResources: [
+        self.query(
+          'TCP Connections ({{pod}})',
+          sum(labels('istio_tcp_connections_opened_total', appLabels), by=['pod'])
+          + ' - ' +
+          sum(labels('istio_tcp_connections_closed_total', appLabels), by=['pod'])
+        ),
+        self.query(
+          'Open File Descriptors ({{pod}})',
+          sum(labels('process_open_fds', appLabels), by=['pod'])
+        ),
+        self.query(
+          'Open Sockets ({{pod}})',
+          sum(labels('istio_tcp_sockets_open', appLabels), by=['pod'])
+        ),
+      ],
+
       ztunnelXdsConnections:
         self.query(
           'XDS Connection Terminations ({{pod}})',
@@ -161,7 +178,7 @@ local variables = import './variables.libsonnet';
         self.query(
           '{{le}}',
           |||
-            sum(rate(pilot_xds_push_time_bucket{}[1m])) by (le)
+            sum(rate(pilot_xds_push_time_bucket{}[$__rate_interval])) by (le)
           |||
         ) + q.withFormat('heatmap'),
 
@@ -169,7 +186,7 @@ local variables = import './variables.libsonnet';
         self.query(
           '{{le}}',
           |||
-            sum(rate(pilot_xds_config_size_bytes_bucket{}[1m])) by (le)
+            sum(rate(pilot_xds_config_size_bytes_bucket{}[$__rate_interval])) by (le)
           |||
         ) + q.withFormat('heatmap'),
 

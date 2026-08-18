@@ -145,6 +145,11 @@ func (i *istioImpl) EastWestGatewayFor(c cluster.Cluster) ingress.Instance {
 	return i.CustomIngressFor(c, name, eastWestIngressIstioLabel)
 }
 
+func (i *istioImpl) EastWestGatewayForAmbient(c cluster.Cluster) ingress.Instance {
+	name := types.NamespacedName{Name: eastWestGatewayName, Namespace: i.cfg.SystemNamespace}
+	return i.CustomIngressFor(c, name, eastWestGatewayLabel)
+}
+
 func (i *istioImpl) CustomIngressFor(c cluster.Cluster, service types.NamespacedName, labelSelector string) ingress.Instance {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -282,11 +287,62 @@ func newKube(ctx resource.Context, cfg Config) (Instance, error) {
 
 	// Execute External Control Plane Installer Script
 	if cfg.ControlPlaneInstaller != "" && !cfg.DeployIstio {
-		scopes.Framework.Infof("============= Execute Control Plane Installer =============")
-		cmd := exec.Command(cfg.ControlPlaneInstaller, "install", workDir)
-		if err := cmd.Run(); err != nil {
-			scopes.Framework.Errorf("failed to run external control plane installer: %v", err)
+		// For multicluster, create and push the CA certs to all clusters to establish a shared root of trust.
+		if i.env.IsMultiCluster() {
+			scopes.Framework.Infof("=== BEGIN: Execute Control Plane Installer Multi-Cluster configuration ===")
+			if err := i.deployCACerts(); err != nil {
+				scopes.Framework.Errorf("Execute Control Plane Installer Multi-Cluster configuration failed on: %v", err)
+				scopes.Framework.Infof("=== FAILED: Execute Control Plane Installer Multi-Cluster configuration ===")
+				return nil, err
+			}
 		}
+
+		scopes.Framework.Infof("=== BEGIN: Execute Control Plane Installer ===")
+		cmd := exec.Command(cfg.ControlPlaneInstaller, "install", workDir)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			scopes.Framework.Errorf("Execute Control Plane Installer failed on: %v\nInstaller output:\n%s", err, string(output))
+			scopes.Framework.Infof("=== FAILED: Execute Control Plane Installer ===")
+			return nil, err
+		}
+		scopes.Framework.Debugf("Control Plane Installer output:\n%s", string(output))
+		scopes.Framework.Infof("=== DONE: Execute Control Plane Installer ===")
+
+		if i.env.IsMultiCluster() {
+			scopes.Framework.Infof("=== BEGIN: Execute Control Plane Installer Multi-Cluster configuration ===")
+			if !cfg.SkipDeployCrossClusterSecrets {
+				if err := i.configureDirectAPIServerAccess(false); err != nil {
+					scopes.Framework.Errorf("Execute Control Plane Installer Multi-Cluster configuration failed on: %v", err)
+					scopes.Framework.Infof("=== FAILED: Execute Control Plane Installer Multi-Cluster configuration ===")
+					return nil, err
+				}
+			}
+
+			if i.env.IsMultiNetwork() {
+				for _, c := range ctx.Clusters().Remotes() {
+					if i.ctx.Settings().Ambient {
+						name := types.NamespacedName{Name: eastWestGatewayName, Namespace: i.cfg.SystemNamespace}
+						_ = i.CustomIngressFor(c, name, eastWestGatewayLabel).DiscoveryAddresses()
+					} else {
+						name := types.NamespacedName{Name: eastWestIngressServiceName, Namespace: i.cfg.SystemNamespace}
+						_ = i.CustomIngressFor(c, name, eastWestIngressIstioLabel).DiscoveryAddresses()
+					}
+				}
+
+				if !i.ctx.Settings().Ambient {
+					for _, c := range ctx.Clusters().Configs() {
+						if err := i.exposeUserServices(c); err != nil {
+							scopes.Framework.Errorf("Execute Control Plane Installer Multi-Cluster configuration failed on: %v", err)
+							scopes.Framework.Infof("=== FAILED: Execute Control Plane Installer Multi-Cluster configuration ===")
+							return nil, err
+						}
+					}
+				}
+			}
+			scopes.Framework.Infof("=== DONE: Execute Control Plane Installer Multi-Cluster configuration ===")
+		}
+
+		return i, nil
 	}
 
 	if !cfg.DeployIstio {
@@ -466,6 +522,15 @@ func (i *istioImpl) installControlPlaneCluster(c cluster.Cluster) error {
 			return nil
 		}
 
+		// only deploy gateway API resources during cluster creation if ambientMultiNetwork
+		// is enabled
+		if i.cfg.DeployGatewayAPI && i.ctx.Settings().AmbientMultiNetwork {
+			if err := DeployGatewayAPI(i.ctx); err != nil {
+				return err
+			}
+			return i.deployAmbientEastWestGateway(c)
+		}
+
 		if err := i.deployEastWestGateway(c, i.primaryIOP.spec.Revision, i.eastwestIOP.file); err != nil {
 			return err
 		}
@@ -623,6 +688,16 @@ func commonInstallArgs(ctx resource.Context, cfg Config, c cluster.Cluster, defa
 	for k, v := range cfg.OperatorOptions {
 		args.AppendSet(k, v)
 	}
+
+	// Set the GatewayClass name for Gateway API if it differs from the default.
+	if cfg.GatewayClassName != "" && cfg.GatewayClassName != DefaultGatewayClassName {
+		args.AppendSet("values.pilot.env.PILOT_GATEWAY_API_DEFAULT_GATEWAYCLASS_NAME", cfg.GatewayClassName)
+	}
+
+	if ctx.Settings().GatewayAPIOnly {
+		args.AppendSet("values.pilot.env.PILOT_IGNORE_RESOURCES", "*.istio.io")
+	}
+
 	return args
 }
 
@@ -900,5 +975,5 @@ func genCommonOperatorFiles(ctx resource.Context, cfg Config, workDir string) (i
 		}
 	}
 
-	return
+	return i, err
 }

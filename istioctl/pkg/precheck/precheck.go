@@ -126,7 +126,7 @@ See %s for more information about causes and resolutions.`, url.ConfigAnalysis)
 }
 
 func checkFromVersion(ctx cli.Context, revision, version string) (diag.Messages, error) {
-	cli, err := ctx.CLIClientWithRevision(revision)
+	cli, err := ctx.CLIClientWithRevision(ctx.RevisionOrDefault(revision))
 	if err != nil {
 		return nil, err
 	}
@@ -216,9 +216,6 @@ func checkControlPlane(ctx cli.Context) (diag.Messages, error) {
 		resource.Namespace(ctx.IstioNamespace()),
 		nil,
 	)
-	if err != nil {
-		return nil, err
-	}
 	sa.AddRunningKubeSource(cli)
 	cancel := make(chan struct{})
 	result, err := sa.Analyze(cancel)

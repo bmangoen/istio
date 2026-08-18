@@ -79,6 +79,9 @@ func NewFakeControllerWithOptions(t test.Failer, opts FakeControllerOptions) (*F
 	if opts.Client == nil {
 		opts.Client = kubelib.NewFakeClient()
 	}
+	if opts.ClusterID == "" {
+		opts.ClusterID = opts.Client.ClusterID()
+	}
 	if opts.MeshWatcher == nil {
 		opts.MeshWatcher = meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{TrustDomain: "cluster.local"})
 	}
@@ -96,7 +99,14 @@ func NewFakeControllerWithOptions(t test.Failer, opts FakeControllerOptions) (*F
 	)
 	kubelib.SetObjectFilter(opts.Client, f)
 
-	meshServiceController := aggregate.NewController(aggregate.Options{MeshHolder: opts.MeshWatcher})
+	var configCluster cluster.ID
+	if opts.ConfigCluster {
+		configCluster = opts.ClusterID
+	}
+	meshServiceController := aggregate.NewController(aggregate.Options{
+		MeshHolder:      opts.MeshWatcher,
+		ConfigClusterID: configCluster,
+	})
 
 	options := Options{
 		DomainSuffix:          domainSuffix,
@@ -111,6 +121,7 @@ func NewFakeControllerWithOptions(t test.Failer, opts FakeControllerOptions) (*F
 		StatusWritingEnabled:  activenotifier.New(false),
 		KrtDebugger:           new(krt.DebugHandler),
 	}
+
 	c := NewController(opts.Client, options)
 	meshServiceController.AddRegistry(c)
 

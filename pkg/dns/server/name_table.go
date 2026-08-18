@@ -17,11 +17,14 @@ package server
 import (
 	"strings"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/config/constants"
 	dnsProto "istio.io/istio/pkg/dns/proto"
 	netutil "istio.io/istio/pkg/util/net"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // Config for building the name table.
@@ -62,62 +65,85 @@ func BuildNameTable(cfg Config) *dnsProto.NameTable {
 				// The IP will be unspecified here if its headless service or if the auto
 				// IP allocation logic for service entry was unable to allocate an IP.
 				if svc.Resolution == model.Passthrough && len(svc.Ports) > 0 {
-					for _, instance := range cfg.Push.ServiceEndpointsByPort(svc, svc.Ports[0].Port, nil) {
-						// addresses may be empty or invalid here
-						isValidInstance := true
-						for _, addr := range instance.Addresses {
-							if !netutil.IsValidIPAddress(addr) {
-								isValidInstance = false
-								break
+					localAddresses := make(map[string][]string)
+					remoteAddresses := make(map[string][]string)
+					hostMetadata := make(map[string]types.NamespacedName)
+					// Iterate all ports to collect endpoints from every EndpointSlice.
+					// Dedup by address since pod IPs are unique (IPAM guarantee).
+					seen := sets.New[string]()
+					for _, endpoints := range cfg.Push.ServiceEndpoints(svc.Key()) {
+						for _, instance := range endpoints {
+							isValidInstance := true
+							for _, addr := range instance.Addresses {
+								if !netutil.IsValidIPAddress(addr) {
+									isValidInstance = false
+									break
+								}
 							}
-						}
-						if len(instance.Addresses) == 0 || !isValidInstance ||
-							(!svc.Attributes.PublishNotReadyAddresses && instance.HealthStatus != model.Healthy) {
-							continue
-						}
-						// TODO(stevenctl): headless across-networks https://github.com/istio/istio/issues/38327
-						sameNetwork := cfg.Node.InNetwork(instance.Network)
-						sameCluster := cfg.Node.InCluster(instance.Locality.ClusterID)
-						// For all k8s headless services, populate the dns table with the endpoint IPs as k8s does.
-						// And for each individual pod, populate the dns table with the endpoint IP with a manufactured host name.
-						if instance.SubDomain != "" && sameNetwork {
-							// Follow k8s pods dns naming convention of "<hostname>.<subdomain>.<pod namespace>.svc.<cluster domain>"
-							// i.e. "mysql-0.mysql.default.svc.cluster.local".
-							parts := strings.SplitN(hostName.String(), ".", 2)
-							if len(parts) != 2 {
+							if len(instance.Addresses) == 0 || !isValidInstance ||
+								(!svc.Attributes.PublishNotReadyAddresses && instance.HealthStatus != model.Healthy) {
 								continue
 							}
-							address := instance.Addresses
-							shortName := instance.HostName + "." + instance.SubDomain
-							host := shortName + "." + parts[1] // Add cluster domain.
-							nameInfo := &dnsProto.NameTable_NameInfo{
-								Ips:       address,
+							if seen.InsertContains(instance.FirstAddressOrNil()) {
+								continue
+							}
+							// TODO(stevenctl): headless across-networks https://github.com/istio/istio/issues/38327
+							sameNetwork := cfg.Node.InNetwork(instance.Network)
+							sameCluster := cfg.Node.InCluster(instance.Locality.ClusterID)
+							// For all k8s headless services, populate the dns table with the endpoint IPs as k8s does.
+							// And for each individual pod, populate the dns table with the endpoint IP with a manufactured host name.
+							if instance.SubDomain != "" && sameNetwork {
+								// Follow k8s pods dns naming convention of "<hostname>.<subdomain>.<pod namespace>.svc.<cluster domain>"
+								// i.e. "mysql-0.mysql.default.svc.cluster.local".
+								parts := strings.SplitN(hostName.String(), ".", 2)
+								if len(parts) != 2 {
+									continue
+								}
+								shortName := instance.HostName + "." + instance.SubDomain
+								host := shortName + "." + parts[1] // Add cluster domain.
+								hostMetadata[host] = types.NamespacedName{Name: shortName, Namespace: svc.Attributes.Namespace}
+								if sameCluster {
+									localAddresses[host] = append(localAddresses[host], instance.Addresses...)
+								} else {
+									remoteAddresses[host] = append(remoteAddresses[host], instance.Addresses...)
+								}
+							}
+							skipForMulticluster := !cfg.MulticlusterHeadlessEnabled && !sameCluster
+							if skipForMulticluster || !sameNetwork {
+								// We take only cluster-local endpoints. While this seems contradictory to
+								// our logic other parts of the code, where cross-cluster is the default.
+								// However, this only impacts the DNS response. If we were to send all
+								// endpoints, cross network routing would break, as we do passthrough LB and
+								// don't go through the network gateway. While we could, hypothetically, send
+								// "network-local" endpoints, this would still make enabling DNS give vastly
+								// different load balancing than without, so its probably best to filter.
+								// This ends up matching the behavior of Kubernetes DNS.
+								continue
+							}
+							addressList = append(addressList, instance.Addresses...)
+						}
+					}
+					// Write local cluster entries first
+					for host, ips := range localAddresses {
+						meta := hostMetadata[host]
+						out.Table[host] = &dnsProto.NameTable_NameInfo{
+							Ips:       ips,
+							Registry:  string(svc.Attributes.ServiceRegistry),
+							Namespace: meta.Namespace,
+							Shortname: meta.Name,
+						}
+					}
+					// Write remote cluster entries only if local doesn't exist
+					for host, ips := range remoteAddresses {
+						if _, exists := localAddresses[host]; !exists {
+							meta := hostMetadata[host]
+							out.Table[host] = &dnsProto.NameTable_NameInfo{
+								Ips:       ips,
 								Registry:  string(svc.Attributes.ServiceRegistry),
-								Namespace: svc.Attributes.Namespace,
-								Shortname: shortName,
-							}
-
-							if _, f := out.Table[host]; !f || sameCluster {
-								// We may have the same pod in two clusters (ie mysql-0 deployed in both places).
-								// We can only return a single IP for these queries. We should prefer the local cluster,
-								// so if the entry already exists only overwrite it if the instance is in our own cluster.
-								out.Table[host] = nameInfo
+								Namespace: meta.Namespace,
+								Shortname: meta.Name,
 							}
 						}
-						skipForMulticluster := !cfg.MulticlusterHeadlessEnabled && !sameCluster
-						if skipForMulticluster || !sameNetwork {
-							// We take only cluster-local endpoints. While this seems contradictory to
-							// our logic other parts of the code, where cross-cluster is the default.
-							// However, this only impacts the DNS response. If we were to send all
-							// endpoints, cross network routing would break, as we do passthrough LB and
-							// don't go through the network gateway. While we could, hypothetically, send
-							// "network-local" endpoints, this would still make enabling DNS give vastly
-							// different load balancing than without, so its probably best to filter.
-							// This ends up matching the behavior of Kubernetes DNS.
-							continue
-						}
-						// TODO: should we skip the node's own IP like we do in listener?
-						addressList = append(addressList, instance.Addresses...)
 					}
 				}
 			}

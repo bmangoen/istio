@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -24,6 +23,7 @@ import (
 	"istio.io/api/label"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/crd"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	common_deploy "istio.io/istio/pkg/test/framework/components/echo/common/deployment"
 	"istio.io/istio/pkg/test/framework/components/echo/common/ports"
@@ -69,6 +69,7 @@ func TestMain(m *testing.M) {
 	framework.
 		NewSuite(m).
 		RequireMinVersion(24).
+		RequireSingleCluster().
 		Label(testlabel.IPv4). // https://github.com/istio/istio/issues/41008
 		Setup(func(t resource.Context) error {
 			t.Settings().Ambient = true
@@ -89,6 +90,12 @@ values:
     env:
       SECRET_TTL: 5m
 `
+			if ctx.Settings().NativeNftables {
+				cfg.ControlPlaneValues += `
+  global:
+    nativeNftables: true
+`
+			}
 		}, cert.CreateCASecretAlt)).
 		Setup(func(t resource.Context) error {
 			return SetupApps(t, i, apps)
@@ -171,6 +178,9 @@ func TestTrafficWithCNIUpgrade(t *testing.T) {
 	framework.NewTest(t).
 		TopLevel().
 		Run(func(t framework.TestContext) {
+			if !crd.SupportsGatewayAPI(t) {
+				t.Skip("requires Gateway API support (k8s >= 1.31)")
+			}
 			apps := common_deploy.NewOrFail(t, common_deploy.Config{
 				NoExternalNamespace: true,
 				IncludeExtAuthz:     false,

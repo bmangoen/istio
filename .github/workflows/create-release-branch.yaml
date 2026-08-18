@@ -1,0 +1,72 @@
+name: Create Release Branch from Upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream istio/istio tag (e.g. 1.23.0)'
+        required: true
+        type: string
+      release_branch:
+        description: 'Release branch name to create (e.g. release-1.23)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  create-release-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        run: |
+          if [[ -z "${{ inputs.upstream_tag }}" || -z "${{ inputs.release_branch }}" ]]; then
+            echo "::error::Both upstream_tag and release_branch are required"
+            exit 1
+          fi
+          if [[ ! "${{ inputs.release_branch }}" =~ ^release-[0-9]+\.[0-9]+$ ]]; then
+            echo "::warning::Branch name '${{ inputs.release_branch }}' does not match expected pattern 'release-X.Y'"
+          fi
+
+      - name: Checkout midstream repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify branch does not already exist
+        run: |
+          if git ls-remote --heads origin "${{ inputs.release_branch }}" | grep -q .; then
+            echo "::error::Branch '${{ inputs.release_branch }}' already exists in origin"
+            exit 1
+          fi
+
+      - name: Add upstream remote and fetch tag
+        run: |
+          git remote add upstream https://github.com/istio/istio.git
+          git fetch upstream tag "${{ inputs.upstream_tag }}" --no-tags
+
+      - name: Verify upstream tag exists
+        run: |
+          if ! git rev-parse "${{ inputs.upstream_tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag '${{ inputs.upstream_tag }}' not found in upstream istio/istio"
+            exit 1
+          fi
+          echo "Resolved tag '${{ inputs.upstream_tag }}' to $(git rev-parse "${{ inputs.upstream_tag }}")"
+
+      - name: Create release branch from upstream tag
+        run: git checkout -b "${{ inputs.release_branch }}" "${{ inputs.upstream_tag }}"
+
+      - name: Push release branch to midstream
+        run: git push origin "${{ inputs.release_branch }}"
+
+      - name: Summary
+        run: |
+          echo "## Release Branch Created" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Detail | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Upstream tag | \`${{ inputs.upstream_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | \`${{ inputs.release_branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`$(git rev-parse HEAD)\` |" >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors
 //
@@ -18,13 +17,18 @@
 package cni
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"istio.io/api/annotation"
 	"istio.io/api/label"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/crd"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	common_deploy "istio.io/istio/pkg/test/framework/components/echo/common/deployment"
 	"istio.io/istio/pkg/test/framework/components/echo/common/ports"
@@ -32,7 +36,6 @@ import (
 	"istio.io/istio/pkg/test/framework/components/echo/match"
 	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/framework/components/namespace"
-	testlabel "istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
 	testKube "istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/scopes"
@@ -60,9 +63,22 @@ type EchoDeployments struct {
 	// Uncaptured echo Service
 	Uncaptured echo.Instances
 
+	// ExcludedNamespace is the ns excluded echo Services will be deployed to.
+	ExcludedNamespace namespace.Instance
+	// echo Service deployed in the mesh-excluded namespace
+	Excluded echo.Instances
+
 	// All echo services
 	All echo.Instances
 }
+
+const (
+	Captured   = "captured"
+	Uncaptured = "uncaptured"
+	Excluded   = "excluded"
+	// ExcludedNS is a fixed namespace name added to the CNI excludeNamespaces config in ControlPlaneValues.
+	ExcludedNS = "cni-excluded-ns"
+)
 
 // TestMain defines the entrypoint for pilot tests using a standard Istio installation.
 // If a test requires a custom install it should go into its own package, otherwise it should go
@@ -72,7 +88,7 @@ func TestMain(m *testing.M) {
 	framework.
 		NewSuite(m).
 		RequireMinVersion(24).
-		Label(testlabel.IPv4). // https://github.com/istio/istio/issues/41008
+		RequireSingleCluster().
 		Setup(func(t resource.Context) error {
 			t.Settings().Ambient = true
 			return nil
@@ -84,11 +100,21 @@ func TestMain(m *testing.M) {
 			cfg.DeployEastWestGW = false
 			cfg.ControlPlaneValues = `
 values:
+  cni:
+    excludeNamespaces:
+      - kube-system
+      - ` + ExcludedNS + `
   ztunnel:
     terminationGracePeriodSeconds: 5
     env:
       SECRET_TTL: 5m
 `
+			if ctx.Settings().NativeNftables {
+				cfg.ControlPlaneValues += `
+  global:
+    nativeNftables: true
+`
+			}
 		}, cert.CreateCASecretAlt)).
 		Setup(func(t resource.Context) error {
 			return SetupApps(t, i, apps)
@@ -96,15 +122,22 @@ values:
 		Run()
 }
 
-const (
-	Captured   = "captured"
-	Uncaptured = "uncaptured"
-)
-
 func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) error {
 	var err error
 	apps.Namespace, err = namespace.New(t, namespace.Config{
 		Prefix: "echo",
+		Inject: false,
+		Labels: map[string]string{
+			label.IoIstioDataplaneMode.Name: "ambient",
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Create the excluded namespace for testing, and label it for ambient to verify excludeNamespaces takes precedence over the ambient label.
+	apps.ExcludedNamespace, err = namespace.Claim(t, namespace.Config{
+		Prefix: ExcludedNS,
 		Inject: false,
 		Labels: map[string]string{
 			label.IoIstioDataplaneMode.Name: "ambient",
@@ -149,6 +182,21 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 					Labels:   map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeNone},
 				},
 			},
+		}).
+		WithConfig(echo.Config{
+			Service:        Excluded,
+			Namespace:      apps.ExcludedNamespace,
+			Ports:          ports.All(),
+			ServiceAccount: true,
+			Subsets: []echo.SubsetConfig{
+				{
+					Replicas: 1,
+					Version:  "v1",
+					Labels: map[string]string{
+						label.IoIstioDataplaneMode.Name: "ambient",
+					},
+				},
+			},
 		})
 
 	// Build the applications
@@ -163,6 +211,7 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 	apps.All = echos
 	apps.Uncaptured = match.ServiceName(echo.NamespacedName{Name: Uncaptured, Namespace: apps.Namespace}).GetMatches(echos)
 	apps.Captured = match.ServiceName(echo.NamespacedName{Name: Captured, Namespace: apps.Namespace}).GetMatches(echos)
+	apps.Excluded = match.ServiceName(echo.NamespacedName{Name: Excluded, Namespace: apps.ExcludedNamespace}).GetMatches(echos)
 
 	return nil
 }
@@ -177,33 +226,101 @@ func TestTrafficWithEstablishedPodsIfCNIMissing(t *testing.T) {
 	framework.NewTest(t).
 		TopLevel().
 		Run(func(t framework.TestContext) {
+			if !crd.SupportsGatewayAPI(t) {
+				t.Skip("requires Gateway API support (k8s >= 1.31)")
+			}
 			apps := common_deploy.NewOrFail(t, common_deploy.Config{
 				NoExternalNamespace: true,
 				IncludeExtAuthz:     false,
 			})
 
+			for _, c := range t.Clusters() {
+				t.Log("Getting current daemonset")
+				// mostly a correctness check - to make sure it's actually there
+				origDS := util.GetCNIDaemonSet(t, c, i.Settings().SystemNamespace)
+
+				ns := apps.SingleNamespaceView().EchoNamespace.Namespace
+				fetchFn := testKube.NewPodFetch(c, ns.Name())
+
+				if _, err := testKube.WaitUntilPodsAreReady(fetchFn); err != nil {
+					t.Fatal(err)
+				}
+
+				t.Log("Deleting current daemonset")
+				// Delete JUST the daemonset - ztunnel + workloads remain in place
+				util.DeleteCNIDaemonset(t, c, i.Settings().SystemNamespace)
+
+				// Our echo instances have already been deployed/configured by the CNI,
+				// so the CNI being removed should not disrupt them.
+				// Skip consistent-hash: after CNI deletion, host health-check rules are
+				// removed which can eventually cause pod restarts. Consistent hashing
+				// pins all traffic from a given source to one backend, so if that
+				// backend is disrupted all retries fail deterministically.
+				common.RunAllTrafficTests(t, i, apps.SingleNamespaceView(), "consistent-hash")
+
+				// put it back
+				util.DeployCNIDaemonset(t, c, origDS)
+			}
+		})
+}
+
+func TestCNIRestartsWithMissingKubeConfig(t *testing.T) {
+	framework.NewTest(t).
+		TopLevel().
+		Run(func(t framework.TestContext) {
+			if !t.Settings().IstioOwnedCNIConfig {
+				t.Skip("CNI kubeconfig removal is only tested when Istio owns the CNI config.")
+			}
 			c := t.Clusters().Default()
-			t.Log("Getting current daemonset")
-			// mostly a correctness check - to make sure it's actually there
-			origDS := util.GetCNIDaemonSet(t, c, i.Settings().SystemNamespace)
 
-			ns := apps.SingleNamespaceView().EchoNamespace.Namespace
-			fetchFn := testKube.NewPodFetch(c, ns.Name())
+			// TODO this is really not very nice - we are mutating cluster state here
+			// with other tests which means other tests can break us and we don't have isolation,
+			// so we have to be more paranoid.
+			//
+			// I don't think we have a good way to solve this ATM so doing stuff like this is as
+			// good as it gets, short of creating an entirely new suite for every possibly-cluster-destructive op.
+			retry.UntilSuccessOrFail(t, func() error {
+				ensureCNIDS := util.GetCNIDaemonSet(t, c, i.Settings().SystemNamespace)
+				if ensureCNIDS.Status.NumberReady == ensureCNIDS.Status.DesiredNumberScheduled {
+					return nil
+				}
+				return fmt.Errorf("still waiting for CNI pods to become ready before starting")
+			}, retry.Delay(1*time.Second), retry.Timeout(80*time.Second))
 
-			if _, err := testKube.WaitUntilPodsAreReady(fetchFn); err != nil {
-				t.Fatal(err)
+			// We are manually deleting var/run/istio-cni/istio-cni-kubeconfig to simulate the file being removed on
+			// a node restart, or some other event that would cause the file to be missing.
+			nodeC := t.Clusters().Default().
+				Kube().CoreV1().Nodes()
+			nodes, err := nodeC.List(context.TODO(), metav1.ListOptions{})
+			if err != nil {
+				t.Fatalf("failed to list cluster nodes: %v", err)
+			}
+			// Delete the kubeconfig file on each node and verify it is deleted
+			for _, node := range nodes.Items {
+				deleteKubeConfigOnHostCmd := fmt.Sprintf("kubectl debug node/%s -n %s --image=busybox -- chroot /host rm"+
+					" -f /var/run/istio-cni/istio-cni-kubeconfig && ! test -f /var/run/istio-cni/istio-cni-kubeconfig",
+					node.Name, i.Settings().SystemNamespace)
+				t.Log("Removing istio-cni-kubeconfig from node", node.Name)
+				if _, err := shell.Execute(true, deleteKubeConfigOnHostCmd); err != nil {
+					t.Fatalf("failed to delete istio-cni-kubeconfig from node %v: %v", node.Name, err)
+				}
 			}
 
-			t.Log("Deleting current daemonset")
-			// Delete JUST the daemonset - ztunnel + workloads remain in place
-			util.DeleteCNIDaemonset(t, c, i.Settings().SystemNamespace)
+			// Restart the CNI daemonsets
+			restartDSPodsCmd := fmt.Sprintf("kubectl delete pods -l k8s-app=istio-cni-node -n %s", i.Settings().SystemNamespace)
+			if _, err := shell.Execute(true, restartDSPodsCmd); err != nil {
+				t.Fatalf("failed to restart daemonset %v", err)
+			}
 
-			// Our echo instances have already been deployed/configured by the CNI,
-			// so the CNI being removed should not disrupt them.
-			common.RunAllTrafficTests(t, i, apps.SingleNamespaceView())
-
-			// put it back
-			util.DeployCNIDaemonset(t, c, origDS)
+			// Check the CNI pods restarted successfully
+			retry.UntilSuccessOrFail(t, func() error {
+				fixedCNIDaemonSet := util.GetCNIDaemonSet(t, c, i.Settings().SystemNamespace)
+				t.Log("Checking missing kubeconfig didn't block CNI Pod")
+				if fixedCNIDaemonSet.Status.NumberReady == fixedCNIDaemonSet.Status.DesiredNumberScheduled {
+					return nil
+				}
+				return fmt.Errorf("still waiting for CNI pods to heal")
+			}, retry.Delay(1*time.Second), retry.Timeout(80*time.Second))
 		})
 }
 
@@ -291,4 +408,59 @@ func TestCNIMisconfigHealsOnRestart(t *testing.T) {
 				return fmt.Errorf("still waiting for CNI pods to heal")
 			}, retry.Delay(1*time.Second), retry.Timeout(80*time.Second))
 		})
+}
+
+// TestCNISkipsEnrollingPodsInExcludedNamespaces verifies that the CNI agent does not enroll pods
+// in namespaces listed in excludeNamespaces, even when both the namespace and pods are labeled for ambient mesh enrollment.
+func TestCNINeverEnrollsPodsInExcludedNamespaces(t *testing.T) {
+	framework.NewTest(t).
+		TopLevel().
+		Run(func(t framework.TestContext) {
+			t.Log("Verifying new, ambient-labeled pods in excluded namespace are not enrolled")
+			assertPodsNotEnrolled(t, apps.Excluded, apps.ExcludedNamespace)
+
+			t.Log("Restarting deployment via rollout restart")
+			for _, instance := range apps.Excluded {
+				if err := instance.Restart(); err != nil {
+					t.Fatalf("failed to restart echo instance: %v", err)
+				}
+			}
+
+			// Verify restarted pods are fully ready before checking enrollment.
+			for _, c := range t.Clusters() {
+				fetchFn := testKube.NewPodFetch(c, apps.ExcludedNamespace.Name(), fmt.Sprintf("app=%s", Excluded))
+				if _, err := testKube.WaitUntilPodsAreReady(fetchFn); err != nil {
+					t.Fatalf("pods not ready after restart: %v", err)
+				}
+			}
+
+			t.Log("Verifying restarted, ambient-labeled pods in excluded namespace are not enrolled")
+			assertPodsNotEnrolled(t, apps.Excluded, apps.ExcludedNamespace)
+		})
+}
+
+// assertPodsNotEnrolled verifies that no pods in the given echo instances have the
+// ambient redirection annotation, indicating they are not enrolled in the mesh.
+// It waits briefly to give the CNI agent time to process pod events, then checks.
+func assertPodsNotEnrolled(t framework.TestContext, echos echo.Instances, ns namespace.Instance) {
+	t.Helper()
+	// Allow the CNI agent time to process pod events via its informers.
+	// If the agent incorrectly tries to enroll these pods, it would happen within this window.
+	time.Sleep(10 * time.Second)
+
+	for _, instance := range echos {
+		for _, w := range instance.WorkloadsOrFail(t) {
+			podName := w.PodName()
+			pod, err := w.Cluster().Kube().CoreV1().Pods(ns.Name()).
+				Get(context.Background(), podName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("failed to get pod %s: %v", podName, err)
+			}
+			if val, ok := pod.Annotations[annotation.AmbientRedirection.Name]; ok {
+				t.Fatalf("pod %s in excluded namespace %s should not be enrolled in ambient mesh, but has annotation %s=%s",
+					podName, ns.Name(), annotation.AmbientRedirection.Name, val)
+			}
+			t.Logf("Confirmed pod %s in namespace %s is not enrolled in ambient mesh", podName, ns.Name())
+		}
+	}
 }

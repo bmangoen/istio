@@ -17,6 +17,7 @@ package analyzers
 import (
 	"istio.io/istio/pkg/config/analysis"
 	"istio.io/istio/pkg/config/analysis/analyzers/annotations"
+	"istio.io/istio/pkg/config/analysis/analyzers/authn"
 	"istio.io/istio/pkg/config/analysis/analyzers/authz"
 	"istio.io/istio/pkg/config/analysis/analyzers/conditions"
 	"istio.io/istio/pkg/config/analysis/analyzers/deployment"
@@ -43,11 +44,15 @@ func All() []analysis.Analyzer {
 	analyzers := []analysis.Analyzer{
 		// Please keep this list sorted alphabetically by pkg.name for convenience
 		&annotations.K8sAnalyzer{},
+		&authn.BlockedCIDRsAnalyzer{},
 		&authz.AuthorizationPoliciesAnalyzer{},
 		&conditions.ConditionAnalyzer{},
 		&deployment.ServiceAssociationAnalyzer{},
 		&deployment.ApplicationUIDAnalyzer{},
+		&destinationrule.CaCertificateAnalyzer{},
+		&destinationrule.PodNotSelectedAnalyzer{},
 		&deprecation.FieldAnalyzer{},
+		&envoyfilter.EnvoyPatchAnalyzer{},
 		&externalcontrolplane.ExternalControlPlaneAnalyzer{},
 		&gateway.IngressGatewayPortAnalyzer{},
 		&gateway.CertificateAnalyzer{},
@@ -57,7 +62,9 @@ func All() []analysis.Analyzer {
 		&injection.ImageAnalyzer{},
 		&injection.ImageAutoAnalyzer{},
 		&k8sgateway.SelectorAnalyzer{},
+		&k8sgateway.CRDVersionAnalyzer{},
 		&multicluster.MeshNetworksAnalyzer{},
+		&multicluster.ServiceAnalyzer{},
 		&service.PortNameAnalyzer{},
 		&sidecar.SelectorAnalyzer{},
 		&virtualservice.ConflictingMeshGatewayHostsAnalyzer{},
@@ -65,15 +72,13 @@ func All() []analysis.Analyzer {
 		&virtualservice.DestinationRuleAnalyzer{},
 		&virtualservice.GatewayAnalyzer{},
 		&virtualservice.JWTClaimRouteAnalyzer{},
-		&destinationrule.CaCertificateAnalyzer{},
 		&serviceentry.ProtocolAddressesAnalyzer{},
+		&serviceentry.ConflictingServiceEntryProtocolAnalyzer{},
 		&webhook.Analyzer{},
-		&envoyfilter.EnvoyPatchAnalyzer{},
-		&telemetry.ProdiverAnalyzer{},
+		&telemetry.ProviderAnalyzer{},
 		&telemetry.SelectorAnalyzer{},
 		&telemetry.DefaultSelectorAnalyzer{},
 		&telemetry.LightstepAnalyzer{},
-		&multicluster.ServiceAnalyzer{},
 	}
 
 	analyzers = append(analyzers, schema.AllValidationAnalyzers()...)

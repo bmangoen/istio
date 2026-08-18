@@ -40,6 +40,7 @@ type informer[I controllers.ComparableObject] struct {
 	augmentation  func(a any) any
 	synced        chan struct{}
 	baseSyncer    Syncer
+	metadata      Metadata
 }
 
 // nolint: unused // (not true, its to implement an interface)
@@ -104,6 +105,10 @@ func (i *informer[I]) GetKey(k string) *I {
 	return nil
 }
 
+func (i *informer[I]) Metadata() Metadata {
+	return i.metadata
+}
+
 func (i *informer[I]) Register(f func(o Event[I])) HandlerRegistration {
 	return registerHandlerAsBatched[I](i, f)
 }
@@ -140,9 +145,23 @@ func (i informerHandlerRegistration) UnregisterHandler() {
 }
 
 // nolint: unused // (not true)
-func (i *informer[I]) index(extract func(o I) []string) kclient.RawIndexer {
-	idx := i.inf.Index(extract)
-	return idx
+type informerIndex[I any] struct {
+	idx kclient.RawIndexer
+}
+
+// nolint: unused // (not true)
+func (ii *informerIndex[I]) Lookup(key string) []I {
+	return slices.Map(ii.idx.Lookup(key), func(i any) I {
+		return i.(I)
+	})
+}
+
+// nolint: unused // (not true)
+func (i *informer[I]) index(name string, extract func(o I) []string) indexer[I] {
+	idx := i.inf.Index(name, extract)
+	return &informerIndex[I]{
+		idx: idx,
+	}
 }
 
 func informerEventHandler[I controllers.ComparableObject](handler func(o Event[I], initialSync bool)) cache.ResourceEventHandler {
@@ -193,6 +212,10 @@ func WrapClient[I controllers.ComparableObject](c kclient.Informer[I], opts ...C
 		synced: h.synced,
 	}
 
+	if o.metadata != nil {
+		h.metadata = o.metadata
+	}
+
 	go func() {
 		defer c.ShutdownHandlers()
 		// First, wait for the informer to populate. We ignore handlers which have their own syncing
@@ -216,12 +239,12 @@ func WrapClient[I controllers.ComparableObject](c kclient.Informer[I], opts ...C
 // kube.Client before this method is called, otherwise
 // NewInformer will panic.
 func NewInformer[I controllers.ComparableObject](c kube.Client, opts ...CollectionOption) Collection[I] {
-	return NewInformerFiltered[I](c, kubetypes.Filter{}, opts...)
+	return NewFilteredInformer[I](c, kubetypes.Filter{}, opts...)
 }
 
-// NewInformerFiltered takes an argument that filters the
+// NewFilteredInformer takes an argument that filters the
 // results from the kube.Client. Otherwise, behaves
 // the same as NewInformer
-func NewInformerFiltered[I controllers.ComparableObject](c kube.Client, filter kubetypes.Filter, opts ...CollectionOption) Collection[I] {
+func NewFilteredInformer[I controllers.ComparableObject](c kube.Client, filter kubetypes.Filter, opts ...CollectionOption) Collection[I] {
 	return WrapClient[I](kclient.NewFiltered[I](c, filter), opts...)
 }

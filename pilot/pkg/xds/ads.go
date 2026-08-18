@@ -38,6 +38,7 @@ import (
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/env"
+	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/xds"
 )
@@ -148,7 +149,7 @@ func (s *DiscoveryServer) processRequest(req *discovery.DiscoveryRequest, con *C
 	if strings.HasPrefix(req.TypeUrl, v3.DebugType) {
 		return s.pushXds(con,
 			&model.WatchedResource{TypeUrl: req.TypeUrl, ResourceNames: sets.New(req.ResourceNames...)},
-			&model.PushRequest{Full: true, Push: con.proxy.LastPushContext, Forced: true})
+			&model.PushRequest{Push: con.proxy.LastPushContext, Forced: true})
 	}
 
 	shouldRespond, delta := xds.ShouldRespond(con.proxy, con.ID(), req)
@@ -157,7 +158,6 @@ func (s *DiscoveryServer) processRequest(req *discovery.DiscoveryRequest, con *C
 	}
 
 	request := &model.PushRequest{
-		Full:   true,
 		Push:   con.proxy.LastPushContext,
 		Reason: model.NewReasonStats(model.ProxyRequest),
 
@@ -196,7 +196,7 @@ func (s *DiscoveryServer) Stream(stream DiscoveryStream) error {
 	// Check if server is ready to accept clients and process new requests.
 	// Currently ready means caches have been synced and hence can build
 	// clusters correctly. Without this check, InitContext() call below would
-	// initialize with empty config, leading to reconnected Envoys loosing
+	// initialize with empty config, leading to reconnected Envoys losing
 	// configuration. This is an additional safety check inaddition to adding
 	// cachesSynced logic to readiness probe to handle cases where kube-proxy
 	// ip tables update latencies.
@@ -266,7 +266,7 @@ func (s *DiscoveryServer) initConnection(node *core.Node, con *Connection, ident
 	// this and initializeProxy important. While registering for pushes *after* initialization is complete seems like
 	// a better choice, it introduces a race condition; If we complete initialization of a new push
 	// context between initializeProxy and addCon, we would not get any pushes triggered for the new
-	// push context, leading the proxy to have a stale state until the next full push.
+	// push context, leading the proxy to have a stale state until the next push.
 	s.addCon(con.ID(), con)
 	// Register that initialization is complete. This triggers to calls that it is safe to access the
 	// proxy
@@ -312,7 +312,7 @@ func (s *DiscoveryServer) initProxyMetadata(node *core.Node) (*model.Proxy, erro
 }
 
 // setTopologyLabels sets locality, cluster, network label
-// must be called after `SetWorkloadLabels` and `SetServiceTargets`.
+// must be called after `SetWorkloadLabels`.
 func setTopologyLabels(proxy *model.Proxy) {
 	// This is a bit un-intuitive, but pull the locality from Labels first. The service registries have the best access to
 	// locality information, as they can read from various sources (Node on Kubernetes, for example). They will take this
@@ -346,9 +346,9 @@ func localityFromProxyLabels(proxy *model.Proxy) *core.Locality {
 	if !f1 && !f2 && !f3 {
 		// If no labels set, we didn't find the locality from the service registry. We do support a (mostly undocumented/internal)
 		// label to override the locality, so respect that here as well.
-		ls, f := proxy.Labels[model.LocalityLabel]
-		if f {
-			return util.ConvertLocality(ls)
+		localityLabel := pm.GetLocalityLabel(proxy.Labels)
+		if localityLabel != "" {
+			return util.ConvertLocality(localityLabel)
 		}
 		return nil
 	}
@@ -385,6 +385,21 @@ func (s *DiscoveryServer) computeProxyState(proxy *model.Proxy, request *model.P
 	proxy.Lock()
 	defer proxy.Unlock()
 	var shouldResetGateway, shouldResetSidecarScope bool
+
+	// Recompute workload labels first so that SetServiceTargets can use them.
+	// The metadata fallback path in GetProxyServiceTargets (used when the pod is not
+	// yet in the informer cache, e.g. during rolling istiod restarts) reads proxy.Labels
+	// to match services. If labels are stale/empty at that point, ServiceTargets ends up
+	// empty and inbound clusters are not generated.
+	// only recompute workload labels when
+	// 1. stream established and proxy first time initialization
+	// 2. proxy update
+	recomputeLabels := request == nil || request.IsProxyUpdate()
+	if recomputeLabels {
+		proxy.SetWorkloadLabels(s.Env)
+		setTopologyLabels(proxy)
+	}
+
 	// 1. If request == nil(initiation phase) or request.ConfigsUpdated == nil(global push), set proxy serviceTargets.
 	// 2. otherwise only set when svc update, this is for the case that a service may select the proxy
 	if request == nil || request.Forced ||
@@ -393,15 +408,6 @@ func (s *DiscoveryServer) computeProxyState(proxy *model.Proxy, request *model.P
 		// proxy.SetGatewaysForProxy depends on the serviceTargets,
 		// so when we reset serviceTargets, should reset gateway as well.
 		shouldResetGateway = true
-	}
-
-	// only recompute workload labels when
-	// 1. stream established and proxy first time initialization
-	// 2. proxy update
-	recomputeLabels := request == nil || request.IsProxyUpdate()
-	if recomputeLabels {
-		proxy.SetWorkloadLabels(s.Env)
-		setTopologyLabels(proxy)
 	}
 	// Precompute the sidecar scope and merged gateways associated with this proxy.
 	// Saves compute cycles in networking code. Though this might be redundant sometimes, we still
@@ -417,9 +423,10 @@ func (s *DiscoveryServer) computeProxyState(proxy *model.Proxy, request *model.P
 		}
 		for conf := range request.ConfigsUpdated {
 			switch conf.Kind {
-			case kind.ServiceEntry, kind.DestinationRule, kind.VirtualService, kind.Sidecar, kind.HTTPRoute, kind.TCPRoute, kind.TLSRoute, kind.GRPCRoute:
+			// we intentionally skip kind.Endpoints here, as endpoints do not trigger sidecar scope computation.
+			case kind.ServiceEntry, kind.DestinationRule, kind.VirtualService, kind.PeerAuthentication, kind.Sidecar:
 				shouldResetSidecarScope = true
-			case kind.Gateway, kind.KubernetesGateway, kind.GatewayClass, kind.ReferenceGrant:
+			case kind.Gateway:
 				shouldResetGateway = true
 			case kind.Ingress:
 				shouldResetSidecarScope = true
@@ -434,8 +441,8 @@ func (s *DiscoveryServer) computeProxyState(proxy *model.Proxy, request *model.P
 	if shouldResetSidecarScope {
 		proxy.SetSidecarScope(push)
 	}
-	// only compute gateways for "router" type proxy.
-	if shouldResetGateway && proxy.Type == model.Router {
+	// only compute gateways for "router" type proxy and E/W gateway waypoints.
+	if shouldResetGateway && (proxy.Type == model.Router || proxy.IsAmbientEastWestGateway()) {
 		proxy.SetGatewaysForProxy(push)
 	}
 	proxy.LastPushContext = push
@@ -471,7 +478,7 @@ func (s *DiscoveryServer) DeltaAggregatedResources(stream discovery.AggregatedDi
 func (s *DiscoveryServer) pushConnection(con *Connection, pushEv *Event) error {
 	pushRequest := pushEv.pushRequest
 
-	if pushRequest.Full {
+	if !model.OnlyHasConfigsOfKind(pushRequest.ConfigsUpdated, kind.Endpoints) {
 		// Update Proxy with current information.
 		s.computeProxyState(con.proxy, pushRequest)
 	}
@@ -538,7 +545,6 @@ func (s *DiscoveryServer) ProxyUpdate(clusterID cluster.ID, ip string) {
 	}
 
 	s.pushQueue.Enqueue(connection, &model.PushRequest{
-		Full:   true,
 		Push:   s.globalPushContext(),
 		Start:  time.Now(),
 		Reason: model.NewReasonStats(model.ProxyUpdate),
@@ -546,32 +552,26 @@ func (s *DiscoveryServer) ProxyUpdate(clusterID cluster.ID, ip string) {
 	})
 }
 
-// AdsPushAll will send updates to all nodes, with a full push.
+// AdsPushAll will send updates to all nodes.
 // Mainly used in Debug interface.
 func AdsPushAll(s *DiscoveryServer) {
 	s.AdsPushAll(&model.PushRequest{
-		Full:   true,
 		Push:   s.globalPushContext(),
 		Reason: model.NewReasonStats(model.DebugTrigger),
 		Forced: true,
 	})
 }
 
-// AdsPushAll will send updates to all nodes, for a full config or incremental EDS.
+// AdsPushAll will send updates to all nodes.
 func (s *DiscoveryServer) AdsPushAll(req *model.PushRequest) {
-	if !req.Full {
-		log.Infof("XDS: Incremental Pushing ConnectedEndpoints:%d Version:%s",
-			s.adsClientCount(), req.Push.PushVersion)
-	} else {
-		totalService := len(req.Push.GetAllServices())
-		log.Infof("XDS: Pushing Services:%d ConnectedEndpoints:%d Version:%s",
-			totalService, s.adsClientCount(), req.Push.PushVersion)
-		monServices.Record(float64(totalService))
+	totalService := req.Push.GetTotalServiceCount()
+	log.Infof("XDS: Pushing Services:%d ConnectedEndpoints:%d Version:%s",
+		totalService, s.adsClientCount(), req.Push.PushVersion)
+	monServices.Record(float64(totalService))
 
-		// Make sure the ConfigsUpdated map exists
-		if req.ConfigsUpdated == nil {
-			req.ConfigsUpdated = make(sets.Set[model.ConfigKey])
-		}
+	// Make sure the ConfigsUpdated map exists
+	if req.ConfigsUpdated == nil {
+		req.ConfigsUpdated = make(sets.Set[model.ConfigKey])
 	}
 
 	s.StartPush(req)

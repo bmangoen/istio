@@ -27,8 +27,11 @@ const (
 	ChainedCNIPlugin                  = "chained-cni-plugin"
 	CNINetworkConfigFile              = "cni-network-config-file"
 	CNINetworkConfig                  = "cni-network-config"
+	IstioOwnedCNIConfig               = "istio-owned-cni-config"
+	IstioOwnedCNIConfigFilename       = "istio-owned-cni-config-filename"
 	LogLevel                          = "log-level"
 	KubeconfigMode                    = "kubeconfig-mode"
+	CNIConfGroupRead                  = "cni-conf-group-read"
 	KubeCAFile                        = "kube-ca-file"
 	SkipTLSVerify                     = "skip-tls-verify"
 	MonitoringPort                    = "monitoring-port"
@@ -39,10 +42,14 @@ const (
 	ExcludeNamespaces                 = "exclude-namespaces"
 	PodNamespace                      = "pod-namespace"
 	AmbientEnabled                    = "ambient-enabled"
+	AmbientEnablementSelector         = "ambient-enablement-selector"
 	AmbientDNSCapture                 = "ambient-dns-capture"
 	AmbientIPv6                       = "ambient-ipv6"
 	AmbientDisableSafeUpgrade         = "ambient-disable-safe-upgrade"
 	AmbientReconcilePodRulesOnStartup = "ambient-reconcile-pod-rules-on-startup"
+	EnableAmbientDetectionRetry       = "enable-ambient-detection-retry"
+
+	NativeNftables = "native-nftables"
 
 	// Repair
 	RepairEnabled            = "repair-enabled"
@@ -63,6 +70,8 @@ const (
 // Internal constants
 const (
 	DefaultKubeconfigMode = 0o600
+	CNIConfModeDefault    = 0o600
+	CNIConfModeGroupRead  = 0o640
 	CNIAgentLogScope      = "cni-agent"
 	CNIPluginLogScope     = "cni-plugin"
 	CNIAddEventPath       = "/cmdadd"
@@ -73,11 +82,12 @@ const (
 	RollingLogMaxSizeMB   = 10
 	CNIPluginKubeconfName = "istio-cni-kubeconfig"
 	// K8s liveness and readiness endpoints
-	LivenessEndpoint   = "/healthz"
-	ReadinessEndpoint  = "/readyz"
-	ReadinessPort      = "8000"
-	ServiceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount"
-	SelfNetNSPath      = "/proc/self/ns/net"
+	LivenessEndpoint                   = "/healthz"
+	ReadinessEndpoint                  = "/readyz"
+	ReadinessPort                      = "8000"
+	ServiceAccountPath                 = "/var/run/secrets/kubernetes.io/serviceaccount"
+	SelfNetNSPath                      = "/proc/self/ns/net"
+	DefaultIstioOwnedCNIConfigFilename = "02-istio-cni.conflist"
 )
 
 // Exposed for testing "constants"

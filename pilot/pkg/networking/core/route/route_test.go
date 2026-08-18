@@ -18,17 +18,19 @@ import (
 	"log"
 	"reflect"
 	"testing"
+	"time"
 
 	envoycore "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoyroute "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	extproc "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	. "github.com/onsi/gomega"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/apimachinery/pkg/types"
 
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/core"
 	"istio.io/istio/pilot/pkg/networking/core/route"
@@ -37,18 +39,44 @@ import (
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/gateway/kube"
 	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
-	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/util/sets"
+	"istio.io/istio/pkg/wellknown"
 )
 
 func buildRouteOpts(sr map[host.Name]*model.Service, hash route.DestinationHashMap) route.RouteOptions {
 	return route.RouteOptions{
 		IsTLS:                     false,
 		IsHTTP3AltSvcHeaderNeeded: false,
-		Mesh:                      nil,
+		Mesh:                      mesh.DefaultMeshConfig(),
+		Push:                      nil, // Will be set by individual tests if needed
+		LookupService: func(name host.Name) *model.Service {
+			return sr[name]
+		},
+		LookupDestinationCluster: route.GetDestinationCluster,
+		LookupHash: func(destination *networking.HTTPRouteDestination) *networking.LoadBalancerSettings_ConsistentHashLB {
+			return hash[destination]
+		},
+	}
+}
+
+func buildRouteOptsWithXForwardedHost(sr map[host.Name]*model.Service, hash route.DestinationHashMap) route.RouteOptions {
+	meshConfig := mesh.DefaultMeshConfig()
+	meshConfig.DefaultConfig.ProxyHeaders = &meshconfig.ProxyConfig_ProxyHeaders{
+		XForwardedHost: &meshconfig.ProxyConfig_ProxyHeaders_XForwardedHost{
+			Enabled: &wrapperspb.BoolValue{Value: true},
+		},
+	}
+
+	return route.RouteOptions{
+		IsTLS:                     false,
+		IsHTTP3AltSvcHeaderNeeded: false,
+		Mesh:                      meshConfig,
+		Push:                      nil, // Will be set by individual tests if needed
 		LookupService: func(name host.Name) *model.Service {
 			return sr[name]
 		},
@@ -81,6 +109,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 			IPAddresses: []string{"1.1.1.1"},
 			ID:          "someID",
 			DNSDomain:   "foo.com",
+			Metadata:    &model.NodeMetadata{},
 			IstioVersion: &model.IstioVersion{
 				Major: 1,
 				Minor: 20,
@@ -102,7 +131,9 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		t.Setenv("ISTIO_DEFAULT_REQUEST_TIMEOUT", "0ms")
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, 8080, gatewayNames, routeOpts)
+		routeOptsWithPush := routeOpts
+		routeOptsWithPush.Push = cg.PushContext()
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, 8080, gatewayNames, routeOptsWithPush)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -119,6 +150,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 
 		routeOpts := buildRouteOpts(serviceRegistry, nil)
 		routeOpts.IsHTTP3AltSvcHeaderNeeded = true
+		routeOpts.Push = cg.PushContext()
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
@@ -137,7 +169,9 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithTimeout, 8080, gatewayNames, routeOpts)
+		routeOptsWithPush := routeOpts
+		routeOptsWithPush.Push = cg.PushContext()
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithTimeout, 8080, gatewayNames, routeOptsWithPush)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -152,7 +186,9 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithTimeoutDisabled, 8080, gatewayNames, routeOpts)
+		routeOptsWithPush := routeOpts
+		routeOptsWithPush.Push = cg.PushContext()
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithTimeoutDisabled, 8080, gatewayNames, routeOptsWithPush)
 		xdstest.ValidateRoutes(t, routes)
 
 		g.Expect(err).NotTo(HaveOccurred())
@@ -656,6 +692,242 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g.Expect(routes[0].GetRoute().GetHashPolicy()).To(ConsistOf(hashPolicy))
 	})
 
+	// Test for issue #58708: portLevelSettings port must match destination port
+	t.Run("for virtual service with port level settings matching service port", func(t *testing.T) {
+		g := NewWithT(t)
+		// VirtualService with destination port 8484 (service port)
+		virtualService := config.Config{
+			Meta: config.Meta{
+				GroupVersionKind: gvk.VirtualService,
+				Name:             "acme",
+			},
+			Spec: &networking.VirtualService{
+				Hosts:    []string{},
+				Gateways: []string{"some-gateway"},
+				Http: []*networking.HTTPRoute{
+					{
+						Route: []*networking.HTTPRouteDestination{
+							{
+								Destination: &networking.Destination{
+									Host: "*.example.org",
+									Port: &networking.PortSelector{
+										Number: 8484, // Service port
+									},
+								},
+								Weight: 100,
+							},
+						},
+					},
+				},
+			},
+		}
+		cg := core.NewConfigGenTest(t, core.TestOptions{
+			Services: exampleService,
+			Configs: []config.Config{
+				virtualService,
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.DestinationRule,
+						Name:             "acme",
+						Namespace:        "istio-system",
+					},
+					Spec: &networking.DestinationRule{
+						Host: "*.example.org",
+						TrafficPolicy: &networking.TrafficPolicy{
+							PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+								{
+									Port: &networking.PortSelector{
+										Number: 8484, // Matches service port - should work
+									},
+									LoadBalancer: &networking.LoadBalancerSettings{
+										LbPolicy: loadBalancerPolicy("matching-port-cookie"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+
+		proxy := node(cg)
+		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualService)
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualService, 8080, gatewayNames, routeOpts)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(len(routes)).To(Equal(1))
+
+		// Hash policy should be applied because ports match
+		hashPolicy := &envoyroute.RouteAction_HashPolicy{
+			PolicySpecifier: &envoyroute.RouteAction_HashPolicy_Cookie_{
+				Cookie: &envoyroute.RouteAction_HashPolicy_Cookie{
+					Name: "matching-port-cookie",
+					Ttl:  nil,
+				},
+			},
+		}
+		g.Expect(routes[0].GetRoute().GetHashPolicy()).To(ConsistOf(hashPolicy))
+	})
+
+	// Test for issue #58708: portLevelSettings with mismatched port (e.g., gateway listener port vs service port)
+	t.Run("for virtual service with port level settings mismatched port", func(t *testing.T) {
+		g := NewWithT(t)
+		// VirtualService with destination port 8484 (service port)
+		// but DestinationRule portLevelSettings uses port 443 (gateway listener port)
+		virtualService := config.Config{
+			Meta: config.Meta{
+				GroupVersionKind: gvk.VirtualService,
+				Name:             "acme",
+			},
+			Spec: &networking.VirtualService{
+				Hosts:    []string{},
+				Gateways: []string{"some-gateway"},
+				Http: []*networking.HTTPRoute{
+					{
+						Route: []*networking.HTTPRouteDestination{
+							{
+								Destination: &networking.Destination{
+									Host: "*.example.org",
+									Port: &networking.PortSelector{
+										Number: 8484, // Service port
+									},
+								},
+								Weight: 100,
+							},
+						},
+					},
+				},
+			},
+		}
+		cg := core.NewConfigGenTest(t, core.TestOptions{
+			Services: exampleService,
+			Configs: []config.Config{
+				virtualService,
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.DestinationRule,
+						Name:             "acme",
+						Namespace:        "istio-system",
+					},
+					Spec: &networking.DestinationRule{
+						Host: "*.example.org",
+						TrafficPolicy: &networking.TrafficPolicy{
+							PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{
+								{
+									Port: &networking.PortSelector{
+										Number: 443, // Gateway listener port - does NOT match service port
+									},
+									LoadBalancer: &networking.LoadBalancerSettings{
+										LbPolicy: loadBalancerPolicy("mismatched-port-cookie"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+
+		proxy := node(cg)
+		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualService)
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualService, 8080, gatewayNames, routeOpts)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(len(routes)).To(Equal(1))
+
+		// Hash policy should NOT be applied because ports don't match
+		// This is the expected behavior - portLevelSettings must match destination port
+		g.Expect(routes[0].GetRoute().GetHashPolicy()).To(BeEmpty(),
+			"Hash policy should not be applied when portLevelSettings port (443) doesn't match destination port (8484)")
+	})
+
+	t.Run("for virtual service with cookie hash policy with attributes", func(t *testing.T) {
+		g := NewWithT(t)
+		ttl := durationpb.Duration{Nanos: 100}
+		cg := core.NewConfigGenTest(t, core.TestOptions{
+			Services: exampleService,
+			Configs: []config.Config{
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.DestinationRule,
+						Name:             "acme",
+						Namespace:        "istio-system",
+					},
+					Spec: &networking.DestinationRule{
+						Host: "*.example.org",
+						TrafficPolicy: &networking.TrafficPolicy{
+							LoadBalancer: &networking.LoadBalancerSettings{
+								LbPolicy: &networking.LoadBalancerSettings_ConsistentHash{
+									ConsistentHash: &networking.LoadBalancerSettings_ConsistentHashLB{
+										HashKey: &networking.LoadBalancerSettings_ConsistentHashLB_HttpCookie{
+											HttpCookie: &networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie{
+												Name: "hash-cookie-with-attributes",
+												Ttl:  &ttl,
+												Path: "/api",
+												Attributes: []*networking.LoadBalancerSettings_ConsistentHashLB_HTTPCookie_Attribute{
+													{
+														Name:  "SameSite",
+														Value: "Strict",
+													},
+													{
+														Name:  "Secure",
+														Value: "true",
+													},
+													{
+														Name:  "HttpOnly",
+														Value: "true",
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+
+		proxy := node(cg)
+		hashByDestination := route.GetConsistentHashForVirtualService(cg.PushContext(), proxy, virtualServicePlain)
+		routeOpts := buildRouteOpts(serviceRegistry, hashByDestination)
+		routes, err := route.BuildHTTPRoutesForVirtualService(proxy, virtualServicePlain, 8080, gatewayNames, routeOpts)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(len(routes)).To(Equal(1))
+
+		expectedAttributes := []*envoyroute.RouteAction_HashPolicy_CookieAttribute{
+			{
+				Name:  "SameSite",
+				Value: "Strict",
+			},
+			{
+				Name:  "Secure",
+				Value: "true",
+			},
+			{
+				Name:  "HttpOnly",
+				Value: "true",
+			},
+		}
+
+		hashPolicy := &envoyroute.RouteAction_HashPolicy{
+			PolicySpecifier: &envoyroute.RouteAction_HashPolicy_Cookie_{
+				Cookie: &envoyroute.RouteAction_HashPolicy_Cookie{
+					Name:       "hash-cookie-with-attributes",
+					Ttl:        &ttl,
+					Path:       "/api",
+					Attributes: expectedAttributes,
+				},
+			},
+		}
+		g.Expect(routes[0].GetRoute().GetHashPolicy()).To(ConsistOf(hashPolicy))
+		g.Expect(len(routes[0].GetRoute().GetRetryPolicy().RetryHostPredicate)).To(Equal(0))
+	})
+
 	t.Run("for virtual service with subsets and top level traffic policy with ring hash", func(t *testing.T) {
 		g := NewWithT(t)
 
@@ -959,25 +1231,10 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g.Expect(ok).To(BeFalse())
 	})
 
-	t.Run("for path prefix redirect", func(t *testing.T) {
-		g := NewWithT(t)
-		cg := core.NewConfigGenTest(t, core.TestOptions{})
-
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirectPathPrefix, 8080, gatewayNames, routeOpts)
-		xdstest.ValidateRoutes(t, routes)
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(len(routes)).To(Equal(1))
-
-		redirectAction, ok := routes[0].Action.(*envoyroute.Route_Redirect)
-		g.Expect(ok).NotTo(BeFalse())
-		g.Expect(redirectAction.Redirect.PathRewriteSpecifier).To(Equal(&envoyroute.RedirectAction_PrefixRewrite{
-			PrefixRewrite: "/replace-prefix",
-		}))
-	})
-
 	t.Run("for host rewrite", func(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
+		routeOpts.Push = cg.PushContext()
 
 		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewriteHost, 8080, gatewayNames, routeOpts)
 		xdstest.ValidateRoutes(t, routes)
@@ -1089,22 +1346,44 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		}))
 	})
 
-	t.Run("for redirect uri prefix '%PREFIX()%' that is without gateway semantics", func(t *testing.T) {
+	t.Run("for host rewrite with XForwardedHost enabled", func(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{})
 
-		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg),
-			virtualServiceWithRedirectPathPrefixNoGatewaySematics,
-			8080, gatewayNames, routeOpts)
+		routeOptsWithXForwardedHost := buildRouteOptsWithXForwardedHost(serviceRegistry, nil)
+		routeOptsWithXForwardedHost.Push = cg.PushContext()
+		routeOptsWithXForwardedHost.Push.Mesh = routeOptsWithXForwardedHost.Mesh
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewriteHost, 8080, gatewayNames, routeOptsWithXForwardedHost)
 		xdstest.ValidateRoutes(t, routes)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(len(routes)).To(Equal(1))
 
-		redirectAction, ok := routes[0].Action.(*envoyroute.Route_Redirect)
+		routeAction, ok := routes[0].Action.(*envoyroute.Route_Route)
 		g.Expect(ok).NotTo(BeFalse())
-		g.Expect(redirectAction.Redirect.PathRewriteSpecifier).To(Equal(&envoyroute.RedirectAction_PathRedirect{
-			PathRedirect: "%PREFIX()%/replace-full",
+		g.Expect(routeAction.Route.HostRewriteSpecifier).To(Equal(&envoyroute.RouteAction_HostRewriteLiteral{
+			HostRewriteLiteral: "bar.example.org",
 		}))
+		// Verify that XForwardedHost is enabled
+		g.Expect(routeAction.Route.AppendXForwardedHost).To(Equal(true))
+	})
+
+	t.Run("for prefix path rewrite with XForwardedHost enabled", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := core.NewConfigGenTest(t, core.TestOptions{})
+
+		routeOptsWithXForwardedHost := buildRouteOptsWithXForwardedHost(serviceRegistry, nil)
+		routeOptsWithXForwardedHost.Push = cg.PushContext()
+		routeOptsWithXForwardedHost.Push.Mesh = routeOptsWithXForwardedHost.Mesh
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRewritePrefixPath, 8080, gatewayNames, routeOptsWithXForwardedHost)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(len(routes)).To(Equal(1))
+
+		routeAction, ok := routes[0].Action.(*envoyroute.Route_Route)
+		g.Expect(ok).NotTo(BeFalse())
+		g.Expect(routeAction.Route.PrefixRewrite).To(Equal("/replace-prefix"))
+		// Verify that XForwardedHost is enabled
+		g.Expect(routeAction.Route.AppendXForwardedHost).To(Equal(true))
 	})
 
 	t.Run("for full path redirect", func(t *testing.T) {
@@ -1120,6 +1399,23 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		g.Expect(ok).NotTo(BeFalse())
 		g.Expect(redirectAction.Redirect.PathRewriteSpecifier).To(Equal(&envoyroute.RedirectAction_PathRedirect{
 			PathRedirect: "/replace-full-path",
+		}))
+	})
+
+	t.Run("for prefix_rewrite redirect", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := core.NewConfigGenTest(t, core.TestOptions{})
+
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServiceWithRedirectPrefixRewrite, 8080, gatewayNames, routeOpts)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(len(routes)).To(Equal(1))
+
+		redirectAction, ok := routes[0].Action.(*envoyroute.Route_Redirect)
+		g.Expect(ok).NotTo(BeFalse())
+		g.Expect(redirectAction.Redirect.HostRedirect).To(Equal("foo.example.com"))
+		g.Expect(redirectAction.Redirect.PathRewriteSpecifier).To(Equal(&envoyroute.RedirectAction_PrefixRewrite{
+			PrefixRewrite: "/",
 		}))
 	})
 
@@ -1191,7 +1487,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 			Services: exampleService,
 		})
 		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
-			[]config.Config{}, 8080, map[host.Name]types.NamespacedName{},
+			[]*config.Config{}, 8080, map[host.Name]types.NamespacedName{},
 		)
 		g.Expect(vhosts[0].Routes[0].Action.(*envoyroute.Route_Route).Route.HashPolicy).NotTo(BeNil())
 	})
@@ -1211,7 +1507,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 			Services: exampleService,
 		})
 		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
-			[]config.Config{}, 8080, map[host.Name]types.NamespacedName{},
+			[]*config.Config{}, 8080, map[host.Name]types.NamespacedName{},
 		)
 
 		hashPolicy := &envoyroute.RouteAction_HashPolicy{
@@ -1247,10 +1543,10 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		}
 
 		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
-			[]config.Config{
-				virtualServiceWithWildcardHost,
-				virtualServiceWithNestedWildcardHost,
-				virtualServiceWithGoogleWildcardHost,
+			[]*config.Config{
+				&virtualServiceWithWildcardHost,
+				&virtualServiceWithNestedWildcardHost,
+				&virtualServiceWithGoogleWildcardHost,
 			}, 8080,
 			wildcardIndex,
 		)
@@ -1264,6 +1560,55 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		}
 	})
 
+	t.Run("for virtual service with routing to an service with inference semantics", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := core.NewConfigGenTest(t, core.TestOptions{})
+
+		routeOpts := buildRouteOpts(serviceRegistry, nil)
+		routeOpts.InferencePoolExtensionRefs = map[string]kube.InferencePoolRouteRuleConfig{
+			"routeA": {FQDN: "ext-proc-svc.test-namespace.svc.cluster.local", Port: "9002"},
+		}
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, 8080, gatewayNames, routeOpts)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(routes[0].GetTypedPerFilterConfig()).To(HaveKey(wellknown.HTTPExternalProcessing))
+		extProcPerRoute := new(extproc.ExtProcPerRoute)
+		if err := routes[0].GetTypedPerFilterConfig()[wellknown.HTTPExternalProcessing].UnmarshalTo(extProcPerRoute); err != nil {
+			t.Errorf("couldn't unmarshal any proto: %v \n", err)
+		}
+		// nolint lll
+		g.Expect(extProcPerRoute.GetOverrides().GetGrpcService().GetTargetSpecifier().(*envoycore.GrpcService_EnvoyGrpc_).EnvoyGrpc.GetClusterName()).To(Equal("outbound|9002||ext-proc-svc.test-namespace.svc.cluster.local"))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetRequestBodyMode()).To(Equal(extproc.ProcessingMode_FULL_DUPLEX_STREAMED))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetRequestHeaderMode()).To(Equal(extproc.ProcessingMode_SEND))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetResponseBodyMode()).To(Equal(extproc.ProcessingMode_FULL_DUPLEX_STREAMED))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetResponseHeaderMode()).To(Equal(extproc.ProcessingMode_SEND))
+		g.Expect(extProcPerRoute.GetOverrides().GetFailureModeAllow().GetValue()).To(BeFalse())
+	})
+
+	t.Run("for virtual service with routing to an service with inference semantics with failuremode override", func(t *testing.T) {
+		g := NewWithT(t)
+		cg := core.NewConfigGenTest(t, core.TestOptions{})
+
+		routeOpts := buildRouteOpts(serviceRegistry, nil)
+		routeOpts.InferencePoolExtensionRefs = map[string]kube.InferencePoolRouteRuleConfig{
+			"routeA": {FQDN: "ext-proc-svc.test-namespace.svc.cluster.local", Port: "9002", FailureModeAllow: true},
+		}
+		routes, err := route.BuildHTTPRoutesForVirtualService(node(cg), virtualServicePlain, 8080, gatewayNames, routeOpts)
+		xdstest.ValidateRoutes(t, routes)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(routes[0].GetTypedPerFilterConfig()).To(HaveKey(wellknown.HTTPExternalProcessing))
+		extProcPerRoute := new(extproc.ExtProcPerRoute)
+		if err := routes[0].GetTypedPerFilterConfig()[wellknown.HTTPExternalProcessing].UnmarshalTo(extProcPerRoute); err != nil {
+			t.Errorf("couldn't unmarshal any proto: %v \n", err)
+		}
+		// nolint lll
+		g.Expect(extProcPerRoute.GetOverrides().GetGrpcService().GetTargetSpecifier().(*envoycore.GrpcService_EnvoyGrpc_).EnvoyGrpc.GetClusterName()).To(Equal("outbound|9002||ext-proc-svc.test-namespace.svc.cluster.local"))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetRequestBodyMode()).To(Equal(extproc.ProcessingMode_FULL_DUPLEX_STREAMED))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetRequestHeaderMode()).To(Equal(extproc.ProcessingMode_SEND))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetResponseBodyMode()).To(Equal(extproc.ProcessingMode_FULL_DUPLEX_STREAMED))
+		g.Expect(extProcPerRoute.GetOverrides().GetProcessingMode().GetResponseHeaderMode()).To(Equal(extproc.ProcessingMode_SEND))
+		g.Expect(extProcPerRoute.GetOverrides().GetFailureModeAllow().GetValue()).To(BeTrue())
+	})
 	t.Run("for virtualservices with with wildcard hosts outside of the serviceregistry (on port 80)", func(t *testing.T) {
 		g := NewWithT(t)
 		cg := core.NewConfigGenTest(t, core.TestOptions{
@@ -1288,7 +1633,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		}
 
 		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
-			[]config.Config{virtualServiceWithGoogleWildcardHost}, 80, wildcardIndex,
+			[]*config.Config{&virtualServiceWithGoogleWildcardHost}, 80, wildcardIndex,
 		)
 		// The service hosts (*.example.org and goodbye.hello.example.org) and the unattached VS host (*.google.com)
 		g.Expect(vhosts).To(HaveLen(3))
@@ -1370,6 +1715,7 @@ var virtualServicePlain = config.Config{
 		Gateways: []string{"some-gateway"},
 		Http: []*networking.HTTPRoute{
 			{
+				Name: "routeA",
 				Route: []*networking.HTTPRouteDestination{
 					{
 						Destination: &networking.Destination{
@@ -1899,49 +2245,6 @@ var virtualServiceWithInvalidRedirect = config.Config{
 	},
 }
 
-var virtualServiceWithRedirectPathPrefix = config.Config{
-	Meta: config.Meta{
-		GroupVersionKind: gvk.VirtualService,
-		Name:             "acme",
-		Annotations: map[string]string{
-			"internal.istio.io/route-semantics": "gateway",
-		},
-	},
-	Spec: &networking.VirtualService{
-		Hosts:    []string{},
-		Gateways: []string{"some-gateway"},
-		Http: []*networking.HTTPRoute{
-			{
-				Redirect: &networking.HTTPRedirect{
-					Uri:          "%PREFIX()%/replace-prefix",
-					Authority:    "some-authority.default.svc.cluster.local",
-					RedirectCode: 308,
-				},
-			},
-		},
-	},
-}
-
-var virtualServiceWithRedirectPathPrefixNoGatewaySematics = config.Config{
-	Meta: config.Meta{
-		GroupVersionKind: gvk.VirtualService,
-		Name:             "acme",
-	},
-	Spec: &networking.VirtualService{
-		Hosts:    []string{},
-		Gateways: []string{"some-gateway"},
-		Http: []*networking.HTTPRoute{
-			{
-				Redirect: &networking.HTTPRedirect{
-					Uri:          "%PREFIX()%/replace-full",
-					Authority:    "some-authority.default.svc.cluster.local",
-					RedirectCode: 308,
-				},
-			},
-		},
-	},
-}
-
 var virtualServiceWithRedirectFullPath = config.Config{
 	Meta: config.Meta{
 		GroupVersionKind: gvk.VirtualService,
@@ -1956,6 +2259,26 @@ var virtualServiceWithRedirectFullPath = config.Config{
 					Uri:          "/replace-full-path",
 					Authority:    "some-authority.default.svc.cluster.local",
 					RedirectCode: 308,
+				},
+			},
+		},
+	},
+}
+
+var virtualServiceWithRedirectPrefixRewrite = config.Config{
+	Meta: config.Meta{
+		GroupVersionKind: gvk.VirtualService,
+		Name:             "acme",
+	},
+	Spec: &networking.VirtualService{
+		Hosts:    []string{},
+		Gateways: []string{"some-gateway"},
+		Http: []*networking.HTTPRoute{
+			{
+				Redirect: &networking.HTTPRedirect{
+					Authority:     "foo.example.com",
+					PrefixRewrite: "/",
+					RedirectCode:  301,
 				},
 			},
 		},
@@ -2990,15 +3313,14 @@ func TestSortVHostRoutes(t *testing.T) {
 
 func TestInboundHTTPRoute(t *testing.T) {
 	testCases := []struct {
-		name        string
-		enableRetry bool
-		protocol    protocol.Instance
-		expected    *envoyroute.Route
+		name     string
+		protocol protocol.Instance
+		mesh     *meshconfig.MeshConfig
+		expected *envoyroute.Route
 	}{
 		{
-			name:        "enable retry, http protocol",
-			enableRetry: true,
-			protocol:    protocol.HTTP,
+			name:     "http protocol",
+			protocol: protocol.HTTP,
 			expected: &envoyroute.Route{
 				Name:  "default",
 				Match: route.TranslateRouteMatch(config.Config{}, nil),
@@ -3024,9 +3346,8 @@ func TestInboundHTTPRoute(t *testing.T) {
 			},
 		},
 		{
-			name:        "enable retry, grpc protocol",
-			enableRetry: true,
-			protocol:    protocol.GRPC,
+			name:     "grpc protocol",
+			protocol: protocol.GRPC,
 			expected: &envoyroute.Route{
 				Name:  "default",
 				Match: route.TranslateRouteMatch(config.Config{}, nil),
@@ -3046,9 +3367,73 @@ func TestInboundHTTPRoute(t *testing.T) {
 			},
 		},
 		{
-			name:        "disable retry",
-			enableRetry: false,
-			protocol:    protocol.HTTP,
+			name:     "http protocol with mesh wide inbound retry policy",
+			protocol: protocol.HTTP,
+			mesh: &meshconfig.MeshConfig{
+				DefaultInboundHttpRetryPolicy: &networking.HTTPRetry{
+					Attempts: 5,
+					RetryOn:  "reset,connect-failure",
+					Backoff:  durationpb.New(10 * time.Millisecond),
+				},
+			},
+			expected: &envoyroute.Route{
+				Name:  "default",
+				Match: route.TranslateRouteMatch(config.Config{}, nil),
+				Action: &envoyroute.Route_Route{
+					Route: &envoyroute.RouteAction{
+						ClusterSpecifier: &envoyroute.RouteAction_Cluster{Cluster: "cluster"},
+						RetryPolicy: &envoyroute.RetryPolicy{
+							RetryOn: "reset,connect-failure",
+							NumRetries: &wrapperspb.UInt32Value{
+								Value: 5,
+							},
+							RetriableStatusCodes: []uint32{},
+							RetryBackOff: &envoyroute.RetryPolicy_RetryBackOff{
+								BaseInterval: durationpb.New(10 * time.Millisecond),
+							},
+						},
+						Timeout: route.Notimeout,
+						MaxStreamDuration: &envoyroute.RouteAction_MaxStreamDuration{
+							MaxStreamDuration:    route.Notimeout,
+							GrpcTimeoutHeaderMax: route.Notimeout,
+						},
+					},
+				},
+				Decorator: &envoyroute.Decorator{
+					Operation: "operation",
+				},
+			},
+		},
+		{
+			name:     "http protocol with inbound retries disabled mesh wide",
+			protocol: protocol.HTTP,
+			mesh: &meshconfig.MeshConfig{
+				DefaultInboundHttpRetryPolicy: &networking.HTTPRetry{},
+			},
+			expected: &envoyroute.Route{
+				Name:  "default",
+				Match: route.TranslateRouteMatch(config.Config{}, nil),
+				Action: &envoyroute.Route_Route{
+					Route: &envoyroute.RouteAction{
+						ClusterSpecifier: &envoyroute.RouteAction_Cluster{Cluster: "cluster"},
+						Timeout:          route.Notimeout,
+						MaxStreamDuration: &envoyroute.RouteAction_MaxStreamDuration{
+							MaxStreamDuration:    route.Notimeout,
+							GrpcTimeoutHeaderMax: route.Notimeout,
+						},
+					},
+				},
+				Decorator: &envoyroute.Decorator{
+					Operation: "operation",
+				},
+			},
+		},
+		{
+			name:     "grpc protocol ignores mesh wide inbound retry policy",
+			protocol: protocol.GRPC,
+			mesh: &meshconfig.MeshConfig{
+				DefaultInboundHttpRetryPolicy: &networking.HTTPRetry{Attempts: 5},
+			},
 			expected: &envoyroute.Route{
 				Name:  "default",
 				Match: route.TranslateRouteMatch(config.Config{}, nil),
@@ -3070,9 +3455,7 @@ func TestInboundHTTPRoute(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			test.SetForTest(t, &features.EnableInboundRetryPolicy, tc.enableRetry)
-			inroute := route.BuildDefaultHTTPInboundRoute(&model.Proxy{IstioVersion: &model.IstioVersion{Major: 1, Minor: 24, Patch: -1}},
-				"cluster", "operation", tc.protocol)
+			inroute := route.BuildDefaultHTTPInboundRoute("cluster", "operation", tc.protocol, tc.mesh)
 			if !reflect.DeepEqual(tc.expected, inroute) {
 				t.Errorf("error in inbound routes. Got: %v, Want: %v", inroute, tc.expected)
 			}

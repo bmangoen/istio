@@ -19,7 +19,6 @@ import (
 	"sync"
 
 	"istio.io/istio/pkg/kube/controllers"
-	"istio.io/istio/pkg/kube/kclient"
 	istiolog "istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/ptr"
@@ -34,49 +33,70 @@ const (
 	unknownIndexType indexedDependencyType = iota
 	indexType        indexedDependencyType = iota
 	getKeyType       indexedDependencyType = iota
+	// doNotIndex signals we should not attempt to do an optimized index lookup
+	// This can happen when we fetch the same collection with an index and without an index
+	doNotIndex indexedDependencyType = iota
 )
-
-var allIndexedDependencyTypes = []indexedDependencyType{indexType, getKeyType}
 
 type dependencyState[I any] struct {
 	// collectionDependencies specifies the set of collections we depend on from within the transformation functions (via Fetch).
 	// These are keyed by the internal uid() function on collections.
 	// Note this does not include `parent`, which is the *primary* dependency declared outside of transformation functions.
-	collectionDependencies sets.Set[collectionUID]
+	collectionDependencies       sets.Set[collectionUID]
+	collectionDependencyHandlers map[collectionUID]HandlerRegistration
 	// Stores a map of I -> secondary dependencies (added via Fetch)
 	objectDependencies  map[Key[I]][]*dependency
 	indexedDependencies map[indexedDependency]sets.Set[Key[I]]
-	// indexedDependenciesExtractor stores a map of [collection,fetch type] => an extractor to get change keys.
-	// Note that a given collection can have multiple Fetches, but they are limited to those of the different kind.
-	// I.e. you can do a `Fetch(c1, FilterIndex()) + Fetch(c1, FilterKey())` but not `Fetch(c1, FilterIndex()) + Fetch(c1, FilterIndex())`.
-	// This only applies within a single transformation; it is fine to fetch the the same `c1` in any way from different collections.
+	// indexedDependenciesExtractor stores a map of [collection,fetch type,(optional)index id] => an extractor to get change keys.
 	indexedDependenciesExtractor map[extractorKey]objectKeyExtractor
 }
 
 type extractorKey struct {
-	uid collectionUID
-	typ indexedDependencyType
+	uid       collectionUID
+	filterUID collectionUID
+	typ       indexedDependencyType
 }
 
 func (i dependencyState[I]) update(key Key[I], deps []*dependency) {
-	// Update the I -> Dependency mapping
+	// We will override the current dependencies with the new ones, so
+	// we first remove the existing dependencies from the reverse index
+	// (indexedDependencies). Otherwise, when "I" goes away, a delete
+	// operation might leave some reverse index behind.
+	i.delete(key)
+
+	// Update the I -> Dependency mapping. Notice that we're overriding
+	// all dependencies for the key. That means that as the delete call
+	// above removes the key from objectDependencies, that doesn't matter
+	// as we reassign the key here once again.
 	i.objectDependencies[key] = deps
 	for _, d := range deps {
-		if depKeys, typ, extractor, ok := d.filter.reverseIndexKey(); ok {
+		if depKeys, typ, extractor, filterID, ok := d.filter.reverseIndexKey(); ok {
 			for _, depKey := range depKeys {
 				k := indexedDependency{
 					id:  d.id,
 					key: depKey,
 					typ: typ,
 				}
-				sets.InsertOrNew(i.indexedDependencies, k, key)
-				kk := extractorKey{
-					uid: d.id,
-					typ: typ,
+				if typ == unknownIndexType && extractor == nil {
+					// no need to make keys in the reverse index
+					// if no extractor specified
+					continue
 				}
 
+				sets.InsertOrNew(i.indexedDependencies, k, key)
+				kk := extractorKey{
+					filterUID: filterID,
+					uid:       d.id,
+					typ:       typ,
+				}
 				i.indexedDependenciesExtractor[kk] = extractor
 			}
+		} else {
+			kk := extractorKey{
+				uid: d.id,
+				typ: doNotIndex,
+			}
+			i.indexedDependenciesExtractor[kk] = nil
 		}
 	}
 }
@@ -88,7 +108,7 @@ func (i dependencyState[I]) delete(key Key[I]) {
 	}
 	delete(i.objectDependencies, key)
 	for _, d := range old {
-		if depKeys, typ, _, ok := d.filter.reverseIndexKey(); ok {
+		if depKeys, typ, _, _, ok := d.filter.reverseIndexKey(); ok {
 			for _, depKey := range depKeys {
 				k := indexedDependency{
 					id:  d.id,
@@ -103,15 +123,29 @@ func (i dependencyState[I]) delete(key Key[I]) {
 
 func (i dependencyState[I]) changedInputKeys(sourceCollection collectionUID, events []Event[any]) sets.Set[Key[I]] {
 	changedInputKeys := sets.Set[Key[I]]{}
+
+	// find all the reverse indexes related to the sourceCollection
+	// N here is usually going to be small (the number of FilterKey/FilterIndex)
+	extractorKeys := []extractorKey{}
+	for k := range i.indexedDependenciesExtractor {
+		if k.typ == doNotIndex && k.uid == sourceCollection {
+			extractorKeys = nil
+			break
+		}
+		if k.typ != unknownIndexType && k.uid == sourceCollection {
+			extractorKeys = append(extractorKeys, k)
+		}
+	}
+
 	// Check old and new
 	for _, ev := range events {
-		// We have a possibly dependant object changed. For each input object, see if it depends on the object.
+		// We have a possibly dependent object changed. For each input object, see if it depends on the object.
 		// Naively, we can look through every item in this collection and check if it matches the filter. However, this is
 		// inefficient, especially when the dependency changes frequently and the collection is large.
 		// Where possible, we utilize the reverse-indexing to get the precise list of potentially changed objects.
 		foundAny := false
-		for _, idxTypes := range allIndexedDependencyTypes {
-			ekey := extractorKey{uid: sourceCollection, typ: idxTypes}
+
+		for _, ekey := range extractorKeys {
 			if extractor, f := i.indexedDependenciesExtractor[ekey]; f {
 				foundAny = true
 				// We have a reverse index
@@ -119,7 +153,7 @@ func (i dependencyState[I]) changedInputKeys(sourceCollection collectionUID, eve
 					// Find all the reverse index keys for this object. For each key we will find impacted input objects.
 					keys := extractor(item)
 					for _, key := range keys {
-						for iKey := range i.indexedDependencies[indexedDependency{id: sourceCollection, key: key, typ: idxTypes}] {
+						for iKey := range i.indexedDependencies[indexedDependency{id: sourceCollection, key: key, typ: ekey.typ}] {
 							if changedInputKeys.Contains(iKey) {
 								// We may have already found this item, skip it
 								continue
@@ -150,6 +184,9 @@ func objectChanged(dependencies []*dependency, sourceCollection collectionUID, e
 		if id != sourceCollection {
 			continue
 		}
+		if dep.filter.SuppressChange(ev) {
+			continue
+		}
 		// For each input, we will check if it depends on this event.
 		// We use Items() to check both the old and new object; we will recompute if either matched
 		for _, item := range ev.Items() {
@@ -165,12 +202,6 @@ func objectChanged(dependencies []*dependency, sourceCollection collectionUID, e
 
 // manyCollection builds a mapping from I->O.
 // This can be built from transformation functions of I->*O or I->[]O; both are implemented by this same struct.
-// Locking used here is somewhat complex. We use two locks, mu and recomputeMu.
-//   - mu is responsible for locking the actual data we are storing. List()/Get() calls will lock this.
-//   - recomputeMu is responsible for ensuring there is mutually exclusive access to recomputation. Typically, in a controller
-//     pattern this would be accomplished by a queue. However, these add operational and performance overhead that is not required here.
-//     Instead, we ensure at most one goroutine is recomputing things at a time.
-//     This avoids two dependency updates happening concurrently and writing events out of order.
 type manyCollection[I, O any] struct {
 	// collectionName provides the collectionName for this collection.
 	collectionName string
@@ -181,14 +212,13 @@ type manyCollection[I, O any] struct {
 	// log is a logger for the collection, with additional labels already added to identify it.
 	log *istiolog.Scope
 	// This can be acquired with blockNewEvents held, but only with strict ordering (mu inside blockNewEvents)
-	// mu protects all items grouped below.
+	// mu protects all items grouped below(collectionState, dependencyState, indexes).
 	// This is acquired for reads and writes of data.
-	mu              sync.Mutex
+	mu              sync.RWMutex
 	collectionState multiIndex[I, O]
 	dependencyState dependencyState[I]
-
 	// internal indexes
-	indexes []collectionIndex[I, O]
+	indexes map[string]collectionIndex[I, O]
 
 	// eventHandlers is a list of event handlers registered for the collection. On any changes, each will be notified.
 	eventHandlers *handlerSet[O]
@@ -200,6 +230,7 @@ type manyCollection[I, O any] struct {
 	synced       chan struct{}
 	stop         <-chan struct{}
 	queue        queue.Instance
+	metadata     Metadata
 
 	// onPrimaryInputEventHandler is a specialized internal handler that runs synchronously when a primary input changes
 	onPrimaryInputEventHandler func(o []Event[I])
@@ -213,11 +244,12 @@ type collectionIndex[I, O any] struct {
 	parent  *manyCollection[I, O]
 }
 
-func (c collectionIndex[I, O]) Lookup(key string) []any {
-	c.parent.mu.Lock()
-	defer c.parent.mu.Unlock()
+func (c collectionIndex[I, O]) Lookup(key string) []O {
+	c.parent.mu.RLock()
+	defer c.parent.mu.RUnlock()
 	keys := c.index[key]
-	res := make([]any, 0, len(keys))
+
+	res := make([]O, 0, len(keys))
 	for k := range keys {
 		v, f := c.parent.collectionState.outputs[k]
 		if !f {
@@ -312,8 +344,8 @@ func (h *manyCollection[I, O]) WaitUntilSynced(stop <-chan struct{}) bool {
 
 // nolint: unused // (not true, its to implement an interface)
 func (h *manyCollection[I, O]) dump() CollectionDump {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 
 	inputs := make(map[string]InputDump, len(h.collectionState.inputs))
 	for k, v := range h.collectionState.mappings {
@@ -355,14 +387,18 @@ func (h *manyCollection[I, O]) augment(a any) any {
 }
 
 // nolint: unused // (not true)
-func (h *manyCollection[I, O]) index(extract func(o O) []string) kclient.RawIndexer {
+func (h *manyCollection[I, O]) index(name string, extract func(o O) []string) indexer[O] {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if idx, ok := h.indexes[name]; ok {
+		return idx
+	}
+
 	idx := collectionIndex[I, O]{
 		extract: extract,
 		index:   make(map[string]sets.Set[Key[O]]),
 		parent:  h,
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	for k, v := range h.collectionState.outputs {
 		idx.update(Event[O]{
 			Old:   nil,
@@ -370,7 +406,7 @@ func (h *manyCollection[I, O]) index(extract func(o O) []string) kclient.RawInde
 			Event: controllers.EventAdd,
 		}, k)
 	}
-	h.indexes = append(h.indexes, idx)
+	h.indexes[name] = idx
 	return idx
 }
 
@@ -395,12 +431,11 @@ func (h *manyCollection[I, O]) onPrimaryInputEvent(items []Event[I]) {
 		}
 		items[idx] = ev
 	}
-	h.onPrimaryInputEventLocked(items)
+	h.handleChangedPrimaryInputEvents(items)
 }
 
-// onPrimaryInputEventLocked takes a list of I's that changed and reruns the handler over them.
-// This should be called with recomputeMu acquired.
-func (h *manyCollection[I, O]) onPrimaryInputEventLocked(items []Event[I]) {
+// handleChangedPrimaryInputEvents takes a list of I's that changed and reruns the handler over them.
+func (h *manyCollection[I, O]) handleChangedPrimaryInputEvents(items []Event[I]) {
 	var events []Event[O]
 	recomputedResults := make([]map[Key[O]]O, len(items))
 
@@ -420,7 +455,7 @@ func (h *manyCollection[I, O]) onPrimaryInputEventLocked(items []Event[I]) {
 		pendingDepStateUpdates[iKey] = ctx
 	}
 
-	// Now acquire the full lock. Note we still have recomputeMu held!
+	// Now acquire the full lock.
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for idx, a := range items {
@@ -478,7 +513,7 @@ func (h *manyCollection[I, O]) onPrimaryInputEventLocked(items []Event[I]) {
 				oldRes, oldExists := h.collectionState.outputs[key]
 				e := Event[O]{}
 				if newExists && oldExists {
-					if equal(newRes, oldRes) {
+					if Equal(newRes, oldRes) {
 						// NOP change, skip
 						continue
 					}
@@ -491,6 +526,9 @@ func (h *manyCollection[I, O]) onPrimaryInputEventLocked(items []Event[I]) {
 					e.New = &newRes
 					h.collectionState.outputs[key] = newRes
 				} else {
+					if !oldExists && EnableAssertions {
+						panic(fmt.Sprintf("!oldExists and !newExists in %s(%T), how did we get here? for output key %v input key %v", h.collectionName, h, key, iKey))
+					}
 					e.Event = controllers.EventDelete
 					e.Old = &oldRes
 					delete(h.collectionState.outputs, key)
@@ -507,7 +545,9 @@ func (h *manyCollection[I, O]) onPrimaryInputEventLocked(items []Event[I]) {
 			}
 		}
 	}
-
+	if EnableAssertions {
+		h.assertIndexConsistency()
+	}
 	// Short circuit if we have nothing to do
 	if len(events) == 0 {
 		return
@@ -518,12 +558,8 @@ func (h *manyCollection[I, O]) onPrimaryInputEventLocked(items []Event[I]) {
 	h.eventHandlers.Distribute(events, !h.HasSynced())
 }
 
-// WithJoinUnchecked enables an optimization for join collections, where keys are not deduplicated across collections.
-// This option can only be used when joined collections are disjoint: keys overlapping between collections is undefined behavior
-func WithJoinUnchecked() CollectionOption {
-	return func(c *collectionOptions) {
-		c.joinUnchecked = true
-	}
+func (h *manyCollection[I, O]) Metadata() Metadata {
+	return h.metadata
 }
 
 // NewCollection transforms a Collection[I] to a Collection[O] by applying the provided transformation function.
@@ -540,9 +576,10 @@ func NewCollection[I, O any](c Collection[I], hf TransformationSingle[I, O], opt
 	}
 	o := buildCollectionOptions(opts...)
 	if o.name == "" {
+		// NOTE: this will print Collection[nil, nil] if I or O are interfaces
 		o.name = fmt.Sprintf("Collection[%v,%v]", ptr.TypeName[I](), ptr.TypeName[O]())
 	}
-	return newManyCollection[I, O](c, hm, o, nil)
+	return newManyCollection(c, hm, o, nil)
 }
 
 // NewManyCollection transforms a Collection[I] to a Collection[O] by applying the provided transformation function.
@@ -572,6 +609,7 @@ func newManyCollection[I, O any](
 		parent:         c,
 		dependencyState: dependencyState[I]{
 			collectionDependencies:       sets.New[collectionUID](),
+			collectionDependencyHandlers: map[collectionUID]HandlerRegistration{},
 			objectDependencies:           map[Key[I]][]*dependency{},
 			indexedDependencies:          map[indexedDependency]sets.Set[Key[I]]{},
 			indexedDependenciesExtractor: map[extractorKey]func(o any) []string{},
@@ -581,12 +619,18 @@ func newManyCollection[I, O any](
 			outputs:  map[Key[O]]O{},
 			mappings: map[Key[I]]sets.Set[Key[O]]{},
 		},
+		indexes:                    make(map[string]collectionIndex[I, O]),
 		eventHandlers:              newHandlerSet[O](),
 		augmentation:               opts.augmentation,
 		synced:                     make(chan struct{}),
 		stop:                       opts.stop,
 		onPrimaryInputEventHandler: onPrimaryInputEventHandler,
 	}
+
+	if opts.metadata != nil {
+		h.metadata = opts.metadata
+	}
+
 	h.syncer = channelSyncer{
 		name:   h.collectionName,
 		synced: h.synced,
@@ -596,7 +640,7 @@ func newManyCollection[I, O any](
 	// Create our queue. When it syncs (that is, all items that were present when Run() was called), we mark ourselves as synced.
 	h.queue = queue.NewWithSync(func() {
 		close(h.synced)
-		h.log.Infof("%v synced", h.name())
+		h.log.Infof("%v synced (uid %v)", h.name(), h.uid())
 	}, h.collectionName)
 
 	// Finally, async wait for the primary to be synced. Once it has, we know it has enqueued the initial state.
@@ -614,7 +658,7 @@ func (h *manyCollection[I, O]) runQueue() {
 		return
 	}
 	// Now register to our primary collection. On any event, we will enqueue the update.
-	syncer := c.RegisterBatch(func(o []Event[I]) {
+	parentReg := c.RegisterBatch(func(o []Event[I]) {
 		if h.onPrimaryInputEventHandler != nil {
 			h.onPrimaryInputEventHandler(o)
 		}
@@ -624,9 +668,22 @@ func (h *manyCollection[I, O]) runQueue() {
 		})
 	}, true)
 	// Wait for everything initial state to be enqueued
-	if !syncer.WaitUntilSynced(h.stop) {
+	if !parentReg.WaitUntilSynced(h.stop) {
+		parentReg.UnregisterHandler()
 		return
 	}
+
+	defer func() {
+		// This collection has been stopped, ensure we cleanup all handler registrations we made on
+		// other collections.
+		parentReg.UnregisterHandler()
+		h.mu.Lock()
+		for _, reg := range h.dependencyState.collectionDependencyHandlers {
+			reg.UnregisterHandler()
+		}
+		h.mu.Unlock()
+	}()
+
 	h.queue.Run(h.stop)
 }
 
@@ -669,7 +726,7 @@ func (h *manyCollection[I, O]) onSecondaryDependencyEvent(sourceCollection colle
 			})
 		}
 	}
-	h.onPrimaryInputEventLocked(toRun)
+	h.handleChangedPrimaryInputEvents(toRun)
 }
 
 // nolint: unused // it is used to implement interface
@@ -677,8 +734,8 @@ func (h *manyCollection[I, O]) _internalHandler() {
 }
 
 func (h *manyCollection[I, O]) GetKey(k string) (res *O) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	rf, f := h.collectionState.outputs[Key[O](k)]
 	if f {
 		return &rf
@@ -687,26 +744,28 @@ func (h *manyCollection[I, O]) GetKey(k string) (res *O) {
 }
 
 func (h *manyCollection[I, O]) List() (res []O) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	return maps.Values(h.collectionState.outputs)
 }
 
 func (h *manyCollection[I, O]) Register(f func(o Event[O])) HandlerRegistration {
-	return registerHandlerAsBatched[O](h, f)
+	return registerHandlerAsBatched(h, f)
 }
 
 func (h *manyCollection[I, O]) RegisterBatch(f func(o []Event[O]), runExistingState bool) HandlerRegistration {
 	if !runExistingState {
 		// If we don't to run the initial state this is simple, we just register the handler.
+		h.mu.Lock()
+		defer h.mu.Unlock()
 		return h.eventHandlers.Insert(f, h, nil, h.stop)
 	}
 	// We need to run the initial state, but we don't want to get duplicate events.
 	// We should get "ADD initialObject1, ADD initialObjectN, UPDATE someLaterUpdate" without mixing the initial ADDs
 	// To do this we block any new event processing
 	// Get initial state
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 
 	events := make([]Event[O], 0, len(h.collectionState.outputs))
 	for _, o := range h.collectionState.outputs {
@@ -727,6 +786,24 @@ func (h *manyCollection[I, O]) name() string {
 // nolint: unused // (not true, its to implement an interface)
 func (h *manyCollection[I, O]) uid() collectionUID {
 	return h.id
+}
+
+func (h *manyCollection[I, O]) assertIndexConsistency() {
+	oToI := map[Key[O]]Key[I]{}
+	for i, os := range h.collectionState.mappings {
+		if _, f := h.collectionState.inputs[i]; !f {
+			panic(fmt.Sprintf("for mapping key %v in %s(%T), no input found", i, h.collectionName, h))
+		}
+		for o := range os {
+			if ci, f := oToI[o]; f {
+				panic(fmt.Sprintf("duplicate mapping %v in %s(%T): input %v and %v both map to it", o, h.collectionName, h, ci, i))
+			}
+			oToI[o] = i
+			if _, f := h.collectionState.outputs[o]; !f {
+				panic(fmt.Sprintf("for mapping key %v->%v in %s(%T), no output found", i, o, h.collectionName, h))
+			}
+		}
+	}
 }
 
 // collectionDependencyTracker tracks, for a single transformation call, all dependencies registered.
@@ -752,20 +829,32 @@ func (i *collectionDependencyTracker[I, O]) name() string {
 func (i *collectionDependencyTracker[I, O]) registerDependency(
 	d *dependency,
 	syncer Syncer,
-	register func(f erasedEventHandler) Syncer,
+	register func(f erasedEventHandler) HandlerRegistration,
 ) {
 	i.d = append(i.d, d)
 
+	i.mu.Lock()
+	existed := i.dependencyState.collectionDependencies.InsertContains(d.id)
+	i.mu.Unlock()
 	// For any new collections we depend on, start watching them if its the first time we have watched them.
-	if !i.dependencyState.collectionDependencies.InsertContains(d.id) {
+	if !existed {
 		i.log.WithLabels("collection", d.collectionName).Debugf("register new dependency")
-		syncer.WaitUntilSynced(i.stop)
-		register(func(o []Event[any]) {
+		if !syncer.WaitUntilSynced(i.stop) {
+			return
+		}
+		h := register(func(o []Event[any]) {
 			i.queue.Push(func() error {
 				i.onSecondaryDependencyEvent(d.id, o)
 				return nil
 			})
-		}).WaitUntilSynced(i.stop)
+		})
+		i.mu.Lock()
+		if h.WaitUntilSynced(i.stop) {
+			i.dependencyState.collectionDependencyHandlers[d.id] = h
+		} else {
+			h.UnregisterHandler()
+		}
+		i.mu.Unlock()
 	}
 }
 

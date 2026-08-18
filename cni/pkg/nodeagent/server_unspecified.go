@@ -1,5 +1,4 @@
 //go:build !linux
-// +build !linux
 
 // Copyright Istio Authors
 //
@@ -45,6 +44,10 @@ func (*meshDataplane) AddPodToMesh(ctx context.Context, pod *corev1.Pod, podIPs 
 }
 
 func (*meshDataplane) RemovePodFromMesh(ctx context.Context, pod *corev1.Pod, isDelete bool) error {
+	return errNotImplemented
+}
+
+func (*meshDataplane) SyncHostProbeIPSet(pod *corev1.Pod, podIPs []netip.Addr) error {
 	return errNotImplemented
 }
 

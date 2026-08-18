@@ -1,5 +1,4 @@
 //go:build integ
-// +build integ
 
 // Copyright Istio Authors. All Rights Reserved.
 //
@@ -87,6 +86,8 @@ func TestStatsFilter(t *testing.T) {
 			// In addition, verifies that mocked prometheus could call metrics endpoint with proxy provisioned certs
 			t.NewSubTest("mockprom-to-metrics").Run(
 				func(t framework.TestContext) {
+					// Enable strict mTLS. This is needed for mock secured prometheus scraping test.
+					t.ConfigIstio().YAML(ist.Settings().SystemNamespace, strictMtlsPeerAuthenticationConfig).ApplyOrFail(t)
 					for _, prom := range mockProm {
 						retry.UntilSuccessOrFail(t, func() error {
 							st := match.Cluster(prom.Config().Cluster).FirstOrFail(t, GetTarget().Instances())
@@ -395,7 +396,7 @@ func BuildQueryCommon(labels map[string]string, ns string) (sourceQuery, destina
 	appQuery.Metric = "istio_echo_http_requests_total"
 	appQuery.Labels = map[string]string{"namespace": ns}
 
-	return
+	return sourceQuery, destinationQuery, appQuery
 }
 
 func clone(labels map[string]string) map[string]string {
@@ -430,7 +431,7 @@ func buildQuery(sourceCluster string, enableMXAdditionalLabels bool) (sourceQuer
 		destinationQuery.Labels["downstream_custom_label"] = "a"
 	}
 
-	return
+	return sourceQuery, destinationQuery, appQuery
 }
 
 func buildOutOfMeshServerQuery(sourceCluster string) prometheus.Query {
@@ -540,7 +541,7 @@ func TestGRPCCountMetrics(t *testing.T) {
 			// Metrics to be queried and tested
 			metrics := []string{"istio_request_messages_total", "istio_response_messages_total"}
 			for _, metric := range metrics {
-				t.NewSubTestf(metric).Run(func(t framework.TestContext) {
+				t.NewSubTestf("%s", metric).Run(func(t framework.TestContext) {
 					t.Cleanup(func() {
 						if t.Failed() {
 							util.PromDump(t.Clusters().Default(), promInst, prometheus.Query{Metric: metric})
@@ -612,5 +613,5 @@ func getSupportedIPFamilies(t framework.TestContext) (v4 bool, v6 bool) {
 	if !v4 && !v6 {
 		t.Fatalf("pod is neither v4 nor v6? %v", addrs)
 	}
-	return
+	return v4, v6
 }
