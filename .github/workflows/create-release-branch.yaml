@@ -11,6 +11,10 @@ on:
         description: 'Release branch name to create (e.g. release-1.23)'
         required: true
         type: string
+      source_version:
+        description: 'Source release version to cherry-pick from (e.g. release-1.22). Defaults to n-1 of release_branch'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -36,13 +40,6 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify branch does not already exist
-        run: |
-          if git ls-remote --heads origin "${{ inputs.release_branch }}" | grep -q .; then
-            echo "::error::Branch '${{ inputs.release_branch }}' already exists in origin"
-            exit 1
-          fi
-
       - name: Add upstream remote and fetch tag
         run: |
           git remote add upstream https://github.com/istio/istio.git
@@ -56,10 +53,37 @@ jobs:
           fi
           echo "Resolved tag '${{ inputs.upstream_tag }}' to $(git rev-parse "${{ inputs.upstream_tag }}")"
 
-      - name: Create release branch from upstream tag
-        run: git checkout -b "${{ inputs.release_branch }}" "${{ inputs.upstream_tag }}"
+      - name: Create and push release branch
+        run: |
+          if git ls-remote --heads origin "${{ inputs.release_branch }}" | grep -q .; then
+            echo "Branch '${{ inputs.release_branch }}' already exists, skipping"
+          else
+            git checkout -b "${{ inputs.release_branch }}" "${{ inputs.upstream_tag }}"
+            git push origin "${{ inputs.release_branch }}"
+            echo "Created and pushed branch '${{ inputs.release_branch }}'"
+          fi
 
-      - name: Push release branch to midstream
+      - name: Checkout release branch
+        run: |
+          git checkout "${{ inputs.release_branch }}"
+
+      - name: Install yq
+        uses: mikefarah/yq@master
+
+      - name: Download and run cherry-pick script
+        run: |
+          curl -sSfL -o generate_cherrypick_list.sh \
+            https://raw.githubusercontent.com/openshift-service-mesh/ci-utils/main/istio_release/generate_cherrypick_list.sh
+          chmod +x generate_cherrypick_list.sh
+
+          ARGS="--target ${{ inputs.release_branch }}"
+          if [[ -n "${{ inputs.source_version }}" ]]; then
+            ARGS="$ARGS --source ${{ inputs.source_version }}"
+          fi
+
+          ./generate_cherrypick_list.sh $ARGS
+
+      - name: Push cherry-picked commits
         run: git push origin "${{ inputs.release_branch }}"
 
       - name: Create cherrypick label
