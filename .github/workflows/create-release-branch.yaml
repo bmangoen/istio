@@ -70,7 +70,7 @@ jobs:
       - name: Install yq
         uses: mikefarah/yq@master
 
-      - name: Download and run cherry-pick script
+      - name: Download and run cherry-pick list generator
         run: |
           curl -sSfL -o generate_cherrypick_list.sh \
             https://raw.githubusercontent.com/openshift-service-mesh/ci-utils/main/istio_release/generate_cherrypick_list.sh
@@ -82,6 +82,20 @@ jobs:
           fi
 
           ./generate_cherrypick_list.sh $ARGS
+
+      - name: Apply cherry-picked commits
+        run: |
+          VERSION="${{ inputs.release_branch }}"
+          VERSION="${VERSION#release-}"
+          SCRIPT="cherry-pick-to-release-${VERSION}.sh"
+
+          if [[ ! -f "$SCRIPT" ]]; then
+            echo "::error::Cherry-pick script '$SCRIPT' was not generated"
+            exit 1
+          fi
+
+          chmod +x "$SCRIPT"
+          ./"$SCRIPT"
 
       - name: Push cherry-picked commits
         run: git push origin "${{ inputs.release_branch }}"
